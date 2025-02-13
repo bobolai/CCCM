@@ -6,11 +6,13 @@ env/
 bin/
 lib/
 lib64/
+lib64
 include/
 share/
 pyvenv.cfg
 etc/
 wandb/
+nohup.out
 # ignore Python compiled and cached data
 __pycache__/
 *.pyc
