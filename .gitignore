@@ -1,0 +1,40 @@
+# ignore Python venv
+venv/
+.venv/
+env/
+.env/
+bin/
+lib/
+lib64/
+include/
+share/
+pyvenv.cfg
+etc/
+wandb/
+# ignore Python compiled and cached data
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# ignore IDE config
+.vscode/
+.idea/
+
+# ignore logs
+*.log
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook checkpoint
+.ipynb_checkpoints/
+
+# Pipenv Poetry 
+Pipfile
+Pipfile.lock
+poetry.lock
+
+# data of my own
+data/
+checkpoints/
+lcm_images/
