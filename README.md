@@ -1,2 +1,2 @@
-# 3CM
-Compositional Conditioning Consistency Model
+# StepFusion CCCM
+Compositional Conditioning Consistency Model with Step Fusion
