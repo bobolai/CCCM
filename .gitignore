@@ -13,6 +13,7 @@ pyvenv.cfg
 etc/
 wandb/
 nohup.out
+CACHEDIR.TAG
 # ignore Python compiled and cached data
 __pycache__/
 *.pyc
