@@ -51,6 +51,16 @@ from utils_ccdm import get_model
 
 logger = get_logger(__name__)
 
+
+def ArgsStringToDict(args_):
+    """  ['0.25:0.6', '0.5:0.3', '0.75:0.1'] to {0.25: 0.6, 0.5: 0.3, 0.75: 0.1} """
+    segment_dict = {}
+    for segment in args_:
+        key, value = segment.split(":")
+        segment_dict[float(key)] = float(value)
+    return segment_dict
+
+
 def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weight_dtype=torch.float32, name="target"):
     logger.info("Running validation... ")
     num_atr, num_obj = args.dataset_nums_cond[0], args.dataset_nums_cond[1]
@@ -133,13 +143,13 @@ def main(args):
         tracker_config = {
             "architecture": args.arch,
             "dataset": args.data.split('/')[-1],
-            "teacher_model": args.pretrained_pth,
-            "dataset_nums_cond": args.dataset_nums_cond,
-            "pretrained_nums_cond": args.pretrained_nums_cond,
+            "stepfuse_method": args.stepfuse_method,
             "img_size": args.img_size,
             "train_batch_size": args.train_batch_size,
             "learning_rate": args.lr,
             "epochs": args.epochs,
+            "dataset_nums_cond": args.dataset_nums_cond,
+            "pretrained_nums_cond": args.pretrained_nums_cond,
             "guidance_scale_interval": args.w_interval,
             "num_ddim_timesteps": args.num_ddim_timesteps
         }
@@ -415,14 +425,37 @@ def main(args):
                 
                 # new! 7.5 adaptive x_prev.
                 # use teacher model's prediction more in early epochs, ODE more in late epochs.
-                x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon)
+                x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon) 
                 
-                adaptive_prev_method = "linear"
-                if adaptive_prev_method == "linear":
-                    c_ode = (epoch - start_epoch) / (args.epochs - start_epoch)
-                    c_t = 1 - c_ode
+                c_t = 1
+                c_ode = 0
+                
+                if args.stepfuse_method == "piecewise_linear":
+                    piecewise_dict = ArgsStringToDict(args.piecewise_segments)
+                    # args.piecewise_segments may look like ["0.2:0.6", "0.5:0.3", "0.7:0.2", "0.9:0.1"]
+                    # and c_t will be 1 at the beginning of the training epoch, decreasing gradually to 0.6 at 20% of the epochs,
+                    # 0.3 at 50% of the epochs, 0.2 at 70% of the epochs, 0.1 at 90%, finally 0 at last epochs.
                     
-                # elif adaptive_prev_method = "sigmoid":
+                    segments_keys = sorted(piecewise_dict.keys())
+                    segments_values = [piecewise_dict[k] for k in segments_keys]
+                    # Add start (1.0) and end (0.0) points
+                    segments_keys = [0.0] + segments_keys + [1.0]
+                    segments_values = [1.0] + segments_values + [0.0]
+                    
+                    # Compute the current progress ratio
+                    progress = (epoch - (start_epoch+1)) / max_epoch
+                    # Find the current segment
+                    for i in range(len(segments_keys) - 1):
+                        if segments_keys[i] <= progress < segments_keys[i + 1]:
+                            # Compute linear interpolation in the current segment
+                            c_t = segments_values[i] + (segments_values[i + 1] - segments_values[i]) * \
+                                  (progress - segments_keys[i]) / (segments_keys[i + 1] - segments_keys[i])
+                            c_ode = 1 - c_t
+                            break
+
+                    
+                
+                # elif args.stepfuse_method == "sigmoid":
                     # current_epochs = np.arange(total_epochs)
                     # k = 0.05  # Steepness of the curve
                     # m = total_epochs // 1.6  # Midpoint of the transition
@@ -433,9 +466,13 @@ def main(args):
                     # curve = 1 / (1 + np.exp(-k * (current_epochs - m)))
                     # c_ode = c_end + (c_start - c_end) * curve
                     # c_t = 1 - c_ode 
-                else:
+                elif args.stepfuse_method == "only_ode":
+                    c_ode = 1
+                    c_t = 0
+                elif args.stepfuse_method == "only_teacher":    
+                #else:
                     c_ode = 0
-                    c_t = 1
+                    c_t = 1                  
                     
                 x_prev = c_t * x_prev_teacher + c_ode * x_prev_ode
             
@@ -537,7 +574,7 @@ def main(args):
                         else:
                             torch.save({
                                 'epoch': epoch,
-                                'model': model.state_dict(),
+                                'model': unet.state_dict(),
                                 'optimizer': optimizer.state_dict(),
                                 "loss" : avg_loss
                                 }, 
@@ -551,7 +588,7 @@ def main(args):
                         #print(f"Saved state to {save_root}")
             
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch}
             progress_bar.set_postfix(**logs)
             #accelerator.log(logs, step=global_step)
             accelerator.log(logs)
@@ -599,7 +636,7 @@ if __name__ == "__main__":
     parser.add_argument('--pretrained_nums_cond', nargs='+', type=int, default=[4,2], help="number of classes for pretrained model")
     parser.add_argument('--dataset_nums_cond', nargs='+', type=int, default=None, help="number of conditions for dataset, equals to pretrained_nums_cond if not specified.")
     parser.add_argument('--img_size', type=int, default=128, help="training image size")
-    parser.add_argument('--pretrained_pth', type=str, default='teacher_128_92.pth', help="teacher model name, please put under the same dir as chkpt")
+    parser.add_argument('--pretrained_pth', type=str, default='teacher.pth', help="teacher model name, please put under the same dir as chkpt")
     # ----Batch Size and Training Steps----
     parser.add_argument('--train_batch_size', type=int, default=16, help="training batch size")
     parser.add_argument('--epochs', type=int, default=60, help="total training epochs")
@@ -628,7 +665,11 @@ if __name__ == "__main__":
     parser.add_argument("--checkpointing_steps", type=int, default=4000, help="")
     parser.add_argument("--checkpoints_total_limit", type=int, default=8, help="Max number of checkpoints to store.")
     parser.add_argument('--eval_interval', type=int, default=4000, help="Run validation every X steps")
-    # ----Latent Consistency Distillation (LCD) Specific Arguments----
+   # ----Latent Consistency Distillation (LCD) Specific Arguments----
+    parser.add_argument("--stepfuse_method", type=str, default="piecewise_linear", choices=["piecewise_linear", "only_ode", "only_teacher", "sigmoid", "exponential"])
+    parser.add_argument("--piecewise_segments", type=str, nargs="+", help="Piecewise linear segments in key:value string format.")
+    parser.add_argument("--", type=, default=)
+    
     parser.add_argument("--w_interval", nargs=2, type=float, default=[2.6, 3.0], help="The interval of w for guidance scale sampling when training")
     parser.add_argument("--num_ddim_timesteps", type=int, default=50, help="number of timesteps for DDIM sampling.")
     parser.add_argument("--loss_type", type=str, default="huber", choices=["l2", "huber"], help="The type of loss to use for the LCD loss.")
