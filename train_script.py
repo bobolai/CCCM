@@ -141,23 +141,21 @@ def main(args):
         args.dataset_nums_cond = args.pretrained_nums_cond
         
     if accelerator.is_main_process:
-        if args.debug:
-            break
-            
-        tracker_config = {
-            "architecture": args.arch,
-            "dataset": args.data.split('/')[-1],
-            "stepfuse_method": args.stepfuse_method,
-            "img_size": args.img_size,
-            "train_batch_size": args.train_batch_size,
-            "learning_rate": args.lr,
-            "epochs": args.epochs,
-            "dataset_nums_cond": args.dataset_nums_cond,
-            "pretrained_nums_cond": args.pretrained_nums_cond,
-            "guidance_scale_interval": args.w_interval,
-            "num_ddim_timesteps": args.num_ddim_timesteps
-        }
-        accelerator.init_trackers(args.exp, config=tracker_config)
+        if not args.debug:
+            tracker_config = {
+                "architecture": args.arch,
+                "dataset": args.data.split('/')[-1],
+                "stepfuse_method": args.stepfuse_method,
+                "img_size": args.img_size,
+                "train_batch_size": args.train_batch_size,
+                "learning_rate": args.lr,
+                "epochs": args.epochs,
+                "dataset_nums_cond": args.dataset_nums_cond,
+                "pretrained_nums_cond": args.pretrained_nums_cond,
+                "guidance_scale_interval": args.w_interval,
+                "num_ddim_timesteps": args.num_ddim_timesteps
+            }
+            accelerator.init_trackers(args.exp, config=tracker_config)
         
     # 1.Create the noise scheduler and the desired noise schedule.     
     # ddpm NoiseScheduler calculates the alpha and sigma noise schedules (based on the alpha bars) for us
