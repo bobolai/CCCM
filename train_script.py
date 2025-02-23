@@ -434,6 +434,7 @@ def main(args):
                 c_ode = 0
                 
                 if args.stepfuse_method == "piecewise_linear":
+                    assert args.piecewise_segments is not None "args.piecewise_segments shouldn't be empty."
                     piecewise_dict = ArgsStringToDict(args.piecewise_segments)
                     # args.piecewise_segments may look like ["0.2:0.6", "0.5:0.3", "0.7:0.2", "0.9:0.1"]
                     # and c_t will be 1 at the beginning of the training epoch, 
@@ -632,7 +633,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # ----General----
     parser.add_argument("--debug", action=store_true, help="if debug, wandb logging disabled.")
-    parser.add_argument('--exp', type=str, default="CelebA_128_cd", help="experiment directory name")
+    parser.add_argument('--exp', type=str, default="CelebA128_cd", help="experiment directory name")
     parser.add_argument('--save_path', type=str, default="adaptive_linear1", help="output directory")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument("--resume_pth", type=str, default=None, help="such as unet_30.pth")
