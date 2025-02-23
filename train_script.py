@@ -534,7 +534,8 @@ def main(args):
                     avg_loss = epoch_loss / epoch_batches
                     
                     # log evaluation images to wandb
-                    if global_step % args.eval_interval == 0:
+                    # if global_step % args.eval_interval == 0:
+                    if epoch % args.eval_interval == 0:
                         run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, "online")
                         run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, "target")
                         
@@ -542,7 +543,7 @@ def main(args):
                             accelerator.log({"avg_loss": avg_loss})
                     
                     # save new checkpoints and clear old checkpoints
-                    if global_step % args.checkpointing_steps == 0:
+                    if epoch % args.checkpoint_interval == 0:
                         # check if this save would set us over the `checkpoints_total_limit`, 
                         if args.checkpoints_total_limit is not None:
                             checkpoints = os.listdir(save_root)
@@ -674,9 +675,9 @@ if __name__ == "__main__":
         ),)
     parser.add_argument("--lr_warmup_steps", type=int, default=500, help="warmup steps for lr scheduler.")
     # ----Checkpoint and Eval----
-    parser.add_argument("--checkpointing_steps", type=int, default=4000, help="")
+    parser.add_argument("--checkpoint_interval", type=int, default=2, help="how many epochs per checkpoint saved")
     parser.add_argument("--checkpoints_total_limit", type=int, default=8, help="Max number of checkpoints to store.")
-    parser.add_argument('--eval_interval', type=int, default=4000, help="Run validation every X steps")
+    parser.add_argument('--eval_interval', type=int, default=2, help="Run validation every X epochs")
    # ----Latent Consistency Distillation (LCD) Specific Arguments----
     parser.add_argument("--stepfuse_method", type=str, default="piecewise_linear", choices=["piecewise_linear", "only_ode", "only_teacher", "sigmoid", "exponential"])
     parser.add_argument("--piecewise_segments", type=str, nargs="+", help="Piecewise linear segments in key:value string format.")
