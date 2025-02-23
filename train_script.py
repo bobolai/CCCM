@@ -528,76 +528,6 @@ def main(args):
                 update_ema(target_unet.parameters(), unet.parameters(), args.ema_decay)
                 progress_bar.update(1)
                 global_step += 1
-                
-                if accelerator.is_main_process:
-                    save_root = os.path.join('checkpoints', args.exp, args.save_path)
-                    os.makedirs(save_root, exist_ok=True)
-                    avg_loss = epoch_loss / epoch_batches
-                    
-                    # log evaluation images to wandb
-                    # if global_step % args.eval_interval == 0:
-                    if epoch % args.eval_interval == 0:
-                        run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, "online")
-                        run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, "target")
-                        
-                        if not args.debug:
-                            accelerator.log({"avg_loss": avg_loss})
-                    
-                    # save new checkpoints and clear old checkpoints
-                    if epoch % args.checkpoint_interval == 0:
-                        # check if this save would set us over the `checkpoints_total_limit`, 
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(save_root)
-                            checkpoints = [d for d in checkpoints if d.startswith("unet")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("_")[-1].split(".")[0]))
-                            # remove checkpoints exceeding checkpoints_total_limit
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing checkpoints: {', '.join(removing_checkpoints)}"
-                                )
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(save_root, removing_checkpoint)
-                                    os.remove(removing_checkpoint)
-                        
-                        # save ckpt if loss is better for resume training or later epochs.
-                        if epoch > args.epochs * 0.75 or args.resume_pth is not None :
-                            if avg_loss < best_loss :
-                                best_loss = avg_loss
-                                torch.save({
-                                    'epoch': epoch,
-                                    'model': unet.state_dict(),
-                                    'optimizer': optimizer.state_dict(),
-                                    'loss': avg_loss
-                                    }, 
-                                    os.path.join(save_root, f"unet_best_{epoch}.pth")
-                                )
-                                logger.info(f"unet_best_{epoch}.pth saved to {save_root}")
-                                if not args.debug:
-                                    accelerator.log({"Ckpt_saved?": 1})
-                            else:
-                                print(f"epoch {epoch} not saved.")
-                                if not args.debug:
-                                    accelerator.log({"Ckpt_saved?": 0})
-                            
-                        # not resume or epoch is < 3/4 of total epochs    
-                        else:
-                            torch.save({
-                                'epoch': epoch,
-                                'model': unet.state_dict(),
-                                'optimizer': optimizer.state_dict(),
-                                "loss" : avg_loss
-                                }, 
-                                os.path.join(save_root, f"unet_{epoch}.pth")
-                            )
-                            logger.info(f"unet_{epoch}.pth saved to {save_root}")
-                            if not args.debug:    
-                                accelerator.log({"Ckpt_saved?": 1})
-                            
-                        # accelerator.save_state(save_root)
-                        # save_state saves all the thing from accelerator.prepare, and save them into directories.
-                        #print(f"Saved state to {save_root}")
             
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch}
@@ -607,7 +537,81 @@ def main(args):
                 accelerator.log(logs)
             if global_step >= max_train_steps:
                 break
-                    
+
+        
+        # one epoch done
+        if accelerator.is_main_process:
+            save_root = os.path.join('checkpoints', args.exp, args.save_path)
+            os.makedirs(save_root, exist_ok=True)
+            avg_loss = epoch_loss / epoch_batches
+
+            # log evaluation images to wandb
+            # if global_step % args.eval_interval == 0:
+            if epoch % args.eval_interval == 0:
+                run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, "online")
+                run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, "target")
+
+                if not args.debug:
+                    accelerator.log({"avg_loss": avg_loss})
+
+            # save new checkpoints and clear old checkpoints
+            if epoch % args.checkpoint_interval == 0:
+                # check if this save would set us over the `checkpoints_total_limit`, 
+                if args.checkpoints_total_limit is not None:
+                    checkpoints = os.listdir(save_root)
+                    checkpoints = [d for d in checkpoints if d.startswith("unet")]
+                    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("_")[-1].split(".")[0]))
+                    # remove checkpoints exceeding checkpoints_total_limit
+                    if len(checkpoints) >= args.checkpoints_total_limit:
+                        num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                        removing_checkpoints = checkpoints[0:num_to_remove]
+                        logger.info(
+                            f"{len(checkpoints)} checkpoints already exist, removing checkpoints: {', '.join(removing_checkpoints)}"
+                        )
+                        for removing_checkpoint in removing_checkpoints:
+                            removing_checkpoint = os.path.join(save_root, removing_checkpoint)
+                            os.remove(removing_checkpoint)
+
+                # save ckpt if loss is better for resume training or later epochs.
+                if epoch > args.epochs * 0.75 or args.resume_pth is not None :
+                    if avg_loss < best_loss :
+                        best_loss = avg_loss
+                        torch.save({
+                            'epoch': epoch,
+                            'model': unet.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'loss': avg_loss
+                            }, 
+                            os.path.join(save_root, f"unet_best_{epoch}.pth")
+                        )
+                        logger.info(f"unet_best_{epoch}.pth saved to {save_root}")
+                        if not args.debug:
+                            accelerator.log({"Ckpt_saved?": 1})
+                    else:
+                        print(f"epoch {epoch} not saved.")
+                        if not args.debug:
+                            accelerator.log({"Ckpt_saved?": 0})
+
+                # not resume or epoch is < 3/4 of total epochs    
+                else:
+                    torch.save({
+                        'epoch': epoch,
+                        'model': unet.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        "loss" : avg_loss
+                        }, 
+                        os.path.join(save_root, f"unet_{epoch}.pth")
+                    )
+                    logger.info(f"unet_{epoch}.pth saved to {save_root}")
+                    if not args.debug:    
+                        accelerator.log({"Ckpt_saved?": 1})
+
+                # accelerator.save_state(save_root)
+                # save_state saves all the thing from accelerator.prepare, and save them into directories.
+                #print(f"Saved state to {save_root}")
+        
+        # next epoch
+    
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         #unet = accelerator.unwrap_model(unet)
