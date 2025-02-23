@@ -104,7 +104,8 @@ def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weig
     c1, c2 = c1.cpu().detach().numpy(), c2.cpu().detach().numpy()
     
     images = [(f"{CFG.IDX2ATR[c1[i]]} {CFG.IDX2OBJ[c2[i]]}", images[i, :, :, :]) for i in range(n_samples)]
-    accelerator.log({f"{name} model eval": [wandb.Image(img, caption=label) for label, img in images]})
+    if not args.debug:
+        accelerator.log({f"{name} model eval": [wandb.Image(img, caption=label) for label, img in images]})
 
     del sampler
     gc.collect()
@@ -140,6 +141,9 @@ def main(args):
         args.dataset_nums_cond = args.pretrained_nums_cond
         
     if accelerator.is_main_process:
+        if args.debug:
+            break
+            
         tracker_config = {
             "architecture": args.arch,
             "dataset": args.data.split('/')[-1],
@@ -427,13 +431,15 @@ def main(args):
                 # use teacher model's prediction more in early epochs, ODE more in late epochs.
                 x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon) 
                 
+                # args.stepfuse_method == "only_teacher":
                 c_t = 1
                 c_ode = 0
                 
                 if args.stepfuse_method == "piecewise_linear":
                     piecewise_dict = ArgsStringToDict(args.piecewise_segments)
                     # args.piecewise_segments may look like ["0.2:0.6", "0.5:0.3", "0.7:0.2", "0.9:0.1"]
-                    # and c_t will be 1 at the beginning of the training epoch, decreasing gradually to 0.6 at 20% of the epochs,
+                    # and c_t will be 1 at the beginning of the training epoch, 
+                    # decreasing gradually to 0.6 at 20% of the epochs,
                     # 0.3 at 50% of the epochs, 0.2 at 70% of the epochs, 0.1 at 90%, finally 0 at last epochs.
                     
                     segments_keys = sorted(piecewise_dict.keys())
@@ -451,9 +457,7 @@ def main(args):
                             c_t = segments_values[i] + (segments_values[i + 1] - segments_values[i]) * \
                                   (progress - segments_keys[i]) / (segments_keys[i + 1] - segments_keys[i])
                             c_ode = 1 - c_t
-                            break
-
-                    
+                            break   
                 
                 # elif args.stepfuse_method == "sigmoid":
                     # current_epochs = np.arange(total_epochs)
@@ -466,13 +470,14 @@ def main(args):
                     # curve = 1 / (1 + np.exp(-k * (current_epochs - m)))
                     # c_ode = c_end + (c_start - c_end) * curve
                     # c_t = 1 - c_ode 
+                    
                 elif args.stepfuse_method == "only_ode":
                     c_ode = 1
                     c_t = 0
-                elif args.stepfuse_method == "only_teacher":    
-                #else:
-                    c_ode = 0
-                    c_t = 1                  
+                    
+                # elif args.stepfuse_method == "only_teacher":    
+                #    c_ode = 0
+                #    c_t = 1                  
                     
                 x_prev = c_t * x_prev_teacher + c_ode * x_prev_ode
             
@@ -532,7 +537,9 @@ def main(args):
                     if global_step % args.eval_interval == 0:
                         run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, "online")
                         run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, "target")
-                        accelerator.log({"avg_loss": avg_loss})
+                        
+                        if not args.debug:
+                            accelerator.log({"avg_loss": avg_loss})
                     
                     # save new checkpoints and clear old checkpoints
                     if global_step % args.checkpointing_steps == 0:
@@ -565,10 +572,12 @@ def main(args):
                                     os.path.join(save_root, f"unet_best_{epoch}.pth")
                                 )
                                 logger.info(f"unet_best_{epoch}.pth saved to {save_root}")
-                                accelerator.log({"Ckpt_saved?": 1})
+                                if not args.debug:
+                                    accelerator.log({"Ckpt_saved?": 1})
                             else:
                                 print(f"epoch {epoch} not saved.")
-                                accelerator.log({"Ckpt_saved?": 0})
+                                if not args.debug:
+                                    accelerator.log({"Ckpt_saved?": 0})
                             
                         # not resume or epoch is < 3/4 of total epochs    
                         else:
@@ -581,7 +590,8 @@ def main(args):
                                 os.path.join(save_root, f"unet_{epoch}.pth")
                             )
                             logger.info(f"unet_{epoch}.pth saved to {save_root}")
-                            accelerator.log({"Ckpt_saved?": 1})
+                            if not args.debug:    
+                                accelerator.log({"Ckpt_saved?": 1})
                             
                         # accelerator.save_state(save_root)
                         # save_state saves all the thing from accelerator.prepare, and save them into directories.
@@ -591,7 +601,8 @@ def main(args):
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch}
             progress_bar.set_postfix(**logs)
             #accelerator.log(logs, step=global_step)
-            accelerator.log(logs)
+            if not args.debug:
+                accelerator.log(logs)
             if global_step >= max_train_steps:
                 break
                     
@@ -621,6 +632,7 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # ----General----
+    parser.add_argument("--debug", action=store_true, help="if debug, wandb logging disabled.")
     parser.add_argument('--exp', type=str, default="CelebA_128_cd", help="experiment directory name")
     parser.add_argument('--save_path', type=str, default="adaptive_linear1", help="output directory")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -668,7 +680,7 @@ if __name__ == "__main__":
    # ----Latent Consistency Distillation (LCD) Specific Arguments----
     parser.add_argument("--stepfuse_method", type=str, default="piecewise_linear", choices=["piecewise_linear", "only_ode", "only_teacher", "sigmoid", "exponential"])
     parser.add_argument("--piecewise_segments", type=str, nargs="+", help="Piecewise linear segments in key:value string format.")
-    parser.add_argument("--", type=, default=)
+    # parser.add_argument("--", type=, default=)
     
     parser.add_argument("--w_interval", nargs=2, type=float, default=[2.6, 3.0], help="The interval of w for guidance scale sampling when training")
     parser.add_argument("--num_ddim_timesteps", type=int, default=50, help="number of timesteps for DDIM sampling.")
