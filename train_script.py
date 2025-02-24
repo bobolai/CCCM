@@ -51,6 +51,16 @@ from utils_ccdm import get_model
 
 logger = get_logger(__name__)
 
+
+def ArgsStringToDict(args_):
+    """  ['0.25:0.6', '0.5:0.3', '0.75:0.1'] to {0.25: 0.6, 0.5: 0.3, 0.75: 0.1} """
+    segment_dict = {}
+    for segment in args_:
+        key, value = segment.split(":")
+        segment_dict[float(key)] = float(value)
+    return segment_dict
+
+
 def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weight_dtype=torch.float32, name="target"):
     logger.info("Running validation... ")
     num_atr, num_obj = args.dataset_nums_cond[0], args.dataset_nums_cond[1]
@@ -94,7 +104,8 @@ def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weig
     c1, c2 = c1.cpu().detach().numpy(), c2.cpu().detach().numpy()
     
     images = [(f"{CFG.IDX2ATR[c1[i]]} {CFG.IDX2OBJ[c2[i]]}", images[i, :, :, :]) for i in range(n_samples)]
-    accelerator.log({f"{name} model eval": [wandb.Image(img, caption=label) for label, img in images]})
+    if not args.debug:
+        accelerator.log({f"{name} model eval": [wandb.Image(img, caption=label) for label, img in images]})
 
     del sampler
     gc.collect()
@@ -130,20 +141,21 @@ def main(args):
         args.dataset_nums_cond = args.pretrained_nums_cond
         
     if accelerator.is_main_process:
-        tracker_config = {
-            "architecture": args.arch,
-            "dataset": args.data.split('/')[-1],
-            "teacher_model": args.pretrained_pth,
-            "dataset_nums_cond": args.dataset_nums_cond,
-            "pretrained_nums_cond": args.pretrained_nums_cond,
-            "img_size": args.img_size,
-            "train_batch_size": args.train_batch_size,
-            "learning_rate": args.lr,
-            "epochs": args.epochs,
-            "guidance_scale_interval": args.w_interval,
-            "num_ddim_timesteps": args.num_ddim_timesteps
-        }
-        accelerator.init_trackers(args.exp, config=tracker_config)
+        if not args.debug:
+            tracker_config = {
+                "architecture": args.arch,
+                "dataset": args.data.split('/')[-1],
+                "stepfuse_method": args.stepfuse_method,
+                "img_size": args.img_size,
+                "train_batch_size": args.train_batch_size,
+                "learning_rate": args.lr,
+                "epochs": args.epochs,
+                "dataset_nums_cond": args.dataset_nums_cond,
+                "pretrained_nums_cond": args.pretrained_nums_cond,
+                "guidance_scale_interval": args.w_interval,
+                "num_ddim_timesteps": args.num_ddim_timesteps
+            }
+            accelerator.init_trackers(args.exp, config=tracker_config)
         
     # 1.Create the noise scheduler and the desired noise schedule.     
     # ddpm NoiseScheduler calculates the alpha and sigma noise schedules (based on the alpha bars) for us
@@ -415,14 +427,40 @@ def main(args):
                 
                 # new! 7.5 adaptive x_prev.
                 # use teacher model's prediction more in early epochs, ODE more in late epochs.
-                x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon)
+                x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon) 
                 
-                adaptive_prev_method = "linear"
-                if adaptive_prev_method == "linear":
-                    c_ode = (epoch - start_epoch) / (args.epochs - start_epoch)
-                    c_t = 1 - c_ode
+                # args.stepfuse_method == "only_teacher":
+                c_t = 1
+                c_ode = 0
+                
+                if args.stepfuse_method == "piecewise_linear":
+                    assert args.piecewise_segments is not None, "args.piecewise_segments shouldn't be empty."
+                    piecewise_dict = ArgsStringToDict(args.piecewise_segments)
+                    # args.piecewise_segments may look like ["0.2:0.6", "0.5:0.3", "0.7:0.2", "0.9:0.1"]
+                    # and c_t will be 1 at the beginning of the training epoch, 
+                    # decreasing gradually to 0.6 at 20% of the epochs,
+                    # 0.3 at 50% of the epochs, 0.2 at 70% of the epochs, 0.1 at 90%, finally 0 at last epochs.
                     
-                # elif adaptive_prev_method = "sigmoid":
+                    segments_keys = sorted(piecewise_dict.keys())
+                    segments_values = [piecewise_dict[k] for k in segments_keys]
+                    # Add start (1.0) and end (0.0) points
+                    segments_keys = [0.0] + segments_keys
+                    segments_values = [1.0] + segments_values
+                    
+                    # Compute the current progress ratio
+                    progress = (epoch - (start_epoch)) / (args.epochs - start_epoch)
+                    # Find the current segment
+                    for i in range(len(segments_keys) - 1):
+                        if segments_keys[i] <= progress < segments_keys[i + 1]:
+                            # Compute linear interpolation in the current segment
+                            c_t = segments_values[i] + (segments_values[i + 1] - segments_values[i]) * \
+                                  (progress - segments_keys[i]) / (segments_keys[i + 1] - segments_keys[i])
+                            c_ode = 1 - c_t
+                            break
+                        else:
+                            c_t = segments_values[-1]
+                
+                # elif args.stepfuse_method == "sigmoid":
                     # current_epochs = np.arange(total_epochs)
                     # k = 0.05  # Steepness of the curve
                     # m = total_epochs // 1.6  # Midpoint of the transition
@@ -433,9 +471,14 @@ def main(args):
                     # curve = 1 / (1 + np.exp(-k * (current_epochs - m)))
                     # c_ode = c_end + (c_start - c_end) * curve
                     # c_t = 1 - c_ode 
-                else:
-                    c_ode = 0
-                    c_t = 1
+                    
+                elif args.stepfuse_method == "only_ode":
+                    c_ode = 1
+                    c_t = 0
+                    
+                # elif args.stepfuse_method == "only_teacher":    
+                #    c_ode = 0
+                #    c_t = 1                  
                     
                 x_prev = c_t * x_prev_teacher + c_ode * x_prev_ode
             
@@ -485,79 +528,89 @@ def main(args):
                 update_ema(target_unet.parameters(), unet.parameters(), args.ema_decay)
                 progress_bar.update(1)
                 global_step += 1
-                
-                if accelerator.is_main_process:
-                    save_root = os.path.join('checkpoints', args.exp, args.save_path)
-                    os.makedirs(save_root, exist_ok=True)
-                    avg_loss = epoch_loss / epoch_batches
-                    
-                    # log evaluation images to wandb
-                    if global_step % args.eval_interval == 0:
-                        run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, "online")
-                        run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, "target")
-                        accelerator.log({"avg_loss": avg_loss})
-                    
-                    # save new checkpoints and clear old checkpoints
-                    if global_step % args.checkpointing_steps == 0:
-                        # check if this save would set us over the `checkpoints_total_limit`, 
-                        if args.checkpoints_total_limit is not None:
-                            checkpoints = os.listdir(save_root)
-                            checkpoints = [d for d in checkpoints if d.startswith("unet")]
-                            checkpoints = sorted(checkpoints, key=lambda x: int(x.split("_")[-1].split(".")[0]))
-                            # remove checkpoints exceeding checkpoints_total_limit
-                            if len(checkpoints) >= args.checkpoints_total_limit:
-                                num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
-                                removing_checkpoints = checkpoints[0:num_to_remove]
-                                logger.info(
-                                    f"{len(checkpoints)} checkpoints already exist, removing checkpoints: {', '.join(removing_checkpoints)}"
-                                )
-                                for removing_checkpoint in removing_checkpoints:
-                                    removing_checkpoint = os.path.join(save_root, removing_checkpoint)
-                                    os.remove(removing_checkpoint)
-                        
-                        # save ckpt if loss is better for resume training or later epochs.
-                        if epoch > args.epochs * 0.75 or args.resume_pth is not None :
-                            if avg_loss < best_loss :
-                                best_loss = avg_loss
-                                torch.save({
-                                    'epoch': epoch,
-                                    'model': unet.state_dict(),
-                                    'optimizer': optimizer.state_dict(),
-                                    'loss': avg_loss
-                                    }, 
-                                    os.path.join(save_root, f"unet_best_{epoch}.pth")
-                                )
-                                logger.info(f"unet_best_{epoch}.pth saved to {save_root}")
-                                accelerator.log({"Ckpt_saved?": 1})
-                            else:
-                                print(f"epoch {epoch} not saved.")
-                                accelerator.log({"Ckpt_saved?": 0})
-                            
-                        # not resume or epoch is < 3/4 of total epochs    
-                        else:
-                            torch.save({
-                                'epoch': epoch,
-                                'model': model.state_dict(),
-                                'optimizer': optimizer.state_dict(),
-                                "loss" : avg_loss
-                                }, 
-                                os.path.join(save_root, f"unet_{epoch}.pth")
-                            )
-                            logger.info(f"unet_{epoch}.pth saved to {save_root}")
-                            accelerator.log({"Ckpt_saved?": 1})
-                            
-                        # accelerator.save_state(save_root)
-                        # save_state saves all the thing from accelerator.prepare, and save them into directories.
-                        #print(f"Saved state to {save_root}")
             
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch}
             progress_bar.set_postfix(**logs)
             #accelerator.log(logs, step=global_step)
-            accelerator.log(logs)
+            if not args.debug:
+                accelerator.log(logs)
             if global_step >= max_train_steps:
                 break
-                    
+
+        
+        # one epoch done
+        if accelerator.is_main_process:
+            if not args.debug:
+                accelerator.log({"avg_loss": avg_loss})
+            save_root = os.path.join('checkpoints', args.exp, args.save_path)
+            os.makedirs(save_root, exist_ok=True)
+            avg_loss = epoch_loss / epoch_batches
+
+            # log evaluation images to wandb
+            # if global_step % args.eval_interval == 0:
+            if epoch % args.eval_interval == 0:
+                run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, "online")
+                run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, "target")
+
+            # save new checkpoints and clear old checkpoints
+            if epoch % args.checkpoint_interval == 0:
+                # check if this save would set us over the `checkpoints_total_limit`, 
+                if args.checkpoints_total_limit is not None:
+                    checkpoints = os.listdir(save_root)
+                    checkpoints = [d for d in checkpoints if d.startswith("unet")]
+                    checkpoints = sorted(checkpoints, key=lambda x: int(x.split("_")[-1].split(".")[0]))
+                    # remove checkpoints exceeding checkpoints_total_limit
+                    if len(checkpoints) >= args.checkpoints_total_limit:
+                        num_to_remove = len(checkpoints) - args.checkpoints_total_limit + 1
+                        removing_checkpoints = checkpoints[0:num_to_remove]
+                        logger.info(
+                            f"{len(checkpoints)} checkpoints already exist, removing checkpoints: {', '.join(removing_checkpoints)}"
+                        )
+                        for removing_checkpoint in removing_checkpoints:
+                            removing_checkpoint = os.path.join(save_root, removing_checkpoint)
+                            os.remove(removing_checkpoint)
+
+                # save ckpt if loss is better for resume training or later epochs.
+                if epoch > args.epochs * 0.75 or args.resume_pth is not None :
+                    if avg_loss < best_loss :
+                        best_loss = avg_loss
+                        torch.save({
+                            'epoch': epoch,
+                            'model': unet.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'loss': avg_loss
+                            }, 
+                            os.path.join(save_root, f"unet_best_{epoch}.pth")
+                        )
+                        logger.info(f"unet_best_{epoch}.pth saved to {save_root}")
+                        if not args.debug:
+                            accelerator.log({"Ckpt_saved?": 1})
+                    else:
+                        print(f"epoch {epoch} not saved.")
+                        if not args.debug:
+                            accelerator.log({"Ckpt_saved?": 0})
+
+                # not resume or epoch is < 3/4 of total epochs    
+                else:
+                    torch.save({
+                        'epoch': epoch,
+                        'model': unet.state_dict(),
+                        'optimizer': optimizer.state_dict(),
+                        "loss" : avg_loss
+                        }, 
+                        os.path.join(save_root, f"unet_{epoch}.pth")
+                    )
+                    logger.info(f"unet_{epoch}.pth saved to {save_root}")
+                    if not args.debug:    
+                        accelerator.log({"Ckpt_saved?": 1})
+
+                # accelerator.save_state(save_root)
+                # save_state saves all the thing from accelerator.prepare, and save them into directories.
+                #print(f"Saved state to {save_root}")
+        
+        # next epoch
+    
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         #unet = accelerator.unwrap_model(unet)
@@ -584,7 +637,8 @@ def main(args):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     # ----General----
-    parser.add_argument('--exp', type=str, default="CelebA_128_cd", help="experiment directory name")
+    parser.add_argument("--debug", action="store_true", help="if debug, wandb logging disabled.")
+    parser.add_argument('--exp', type=str, default="CelebA128_cd", help="experiment directory name")
     parser.add_argument('--save_path', type=str, default="adaptive_linear1", help="output directory")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument("--resume_pth", type=str, default=None, help="such as unet_30.pth")
@@ -599,7 +653,7 @@ if __name__ == "__main__":
     parser.add_argument('--pretrained_nums_cond', nargs='+', type=int, default=[4,2], help="number of classes for pretrained model")
     parser.add_argument('--dataset_nums_cond', nargs='+', type=int, default=None, help="number of conditions for dataset, equals to pretrained_nums_cond if not specified.")
     parser.add_argument('--img_size', type=int, default=128, help="training image size")
-    parser.add_argument('--pretrained_pth', type=str, default='teacher_128_92.pth', help="teacher model name, please put under the same dir as chkpt")
+    parser.add_argument('--pretrained_pth', type=str, default='teacher.pth', help="teacher model name, please put under the same dir as chkpt")
     # ----Batch Size and Training Steps----
     parser.add_argument('--train_batch_size', type=int, default=16, help="training batch size")
     parser.add_argument('--epochs', type=int, default=60, help="total training epochs")
@@ -625,10 +679,14 @@ if __name__ == "__main__":
         ),)
     parser.add_argument("--lr_warmup_steps", type=int, default=500, help="warmup steps for lr scheduler.")
     # ----Checkpoint and Eval----
-    parser.add_argument("--checkpointing_steps", type=int, default=4000, help="")
+    parser.add_argument("--checkpoint_interval", type=int, default=2, help="how many epochs per checkpoint saved")
     parser.add_argument("--checkpoints_total_limit", type=int, default=8, help="Max number of checkpoints to store.")
-    parser.add_argument('--eval_interval', type=int, default=4000, help="Run validation every X steps")
-    # ----Latent Consistency Distillation (LCD) Specific Arguments----
+    parser.add_argument('--eval_interval', type=int, default=2, help="Run validation every X epochs")
+   # ----Latent Consistency Distillation (LCD) Specific Arguments----
+    parser.add_argument("--stepfuse_method", type=str, default="piecewise_linear", choices=["piecewise_linear", "only_ode", "only_teacher", "sigmoid", "exponential"])
+    parser.add_argument("--piecewise_segments", type=str, nargs="+", help="Piecewise linear segments in key:value string format.")
+    # parser.add_argument("--", type=, default=)
+    
     parser.add_argument("--w_interval", nargs=2, type=float, default=[2.6, 3.0], help="The interval of w for guidance scale sampling when training")
     parser.add_argument("--num_ddim_timesteps", type=int, default=50, help="number of timesteps for DDIM sampling.")
     parser.add_argument("--loss_type", type=str, default="huber", choices=["l2", "huber"], help="The type of loss to use for the LCD loss.")

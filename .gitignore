@@ -31,7 +31,9 @@ Thumbs.db
 
 # Jupyter Notebook checkpoint
 .ipynb_checkpoints/
-
+consistency_distillation.ipynb
+train_lcm_distill_sd_wds.ipynb
+LCMStest.ipynb
 # Pipenv Poetry 
 Pipfile
 Pipfile.lock
@@ -41,3 +43,4 @@ poetry.lock
 data/
 checkpoints/
 lcm_images/
+result/CelebA128_cd/
