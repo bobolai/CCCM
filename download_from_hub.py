@@ -17,8 +17,8 @@ def main(args):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--file", type=str, help="file you want to download from hg StepFusionCCCM repo")
-    parser.add_argument("--dest", type=str, help="local path you want your downloaded file to be saved.")
+    parser.add_argument('-f', "--file", type=str, help="file you want to download from hg StepFusionCCCM repo")
+    parser.add_argument('-d', "--dest", type=str, help="local path you want your downloaded file to be saved.")
 
     args = parser.parse_args()
 
