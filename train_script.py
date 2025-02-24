@@ -541,6 +541,8 @@ def main(args):
         
         # one epoch done
         if accelerator.is_main_process:
+            if not args.debug:
+                accelerator.log({"avg_loss": avg_loss})
             save_root = os.path.join('checkpoints', args.exp, args.save_path)
             os.makedirs(save_root, exist_ok=True)
             avg_loss = epoch_loss / epoch_batches
@@ -550,9 +552,6 @@ def main(args):
             if epoch % args.eval_interval == 0:
                 run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, "online")
                 run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, "target")
-
-                if not args.debug:
-                    accelerator.log({"avg_loss": avg_loss})
 
             # save new checkpoints and clear old checkpoints
             if epoch % args.checkpoint_interval == 0:
