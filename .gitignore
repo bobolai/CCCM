@@ -44,4 +44,5 @@ poetry.lock
 data/
 checkpoints/
 lcm_images/
-result/CelebA128_cd/
+result/colored_mnist/
+result/ShapeColorAdd_cd/
