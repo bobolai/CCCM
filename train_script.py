@@ -47,19 +47,10 @@ from models.unet import Swish, UpSample, DownSample, AdaGroupNorm, TimestepEmbed
 from models.unet import UNet
 from utils import DDIMSolver, update_ema, guidance_scale_embedding, append_dims, extract, set_seed, load_checkpoint
 from utils import scalings_for_boundary_conditions, get_predicted_original_sample, get_predicted_noise, get_ddim_timesteps
+from utils import StepFuseScheduler
 from utils_ccdm import get_model
 
 logger = get_logger(__name__)
-
-
-def ArgsStringToDict(args_):
-    """  ['0.25:0.6', '0.5:0.3', '0.75:0.1'] to {0.25: 0.6, 0.5: 0.3, 0.75: 0.1} """
-    segment_dict = {}
-    for segment in args_:
-        key, value = segment.split(":")
-        segment_dict[float(key)] = float(value)
-    return segment_dict
-
 
 def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weight_dtype=torch.float32, name="target"):
     logger.info("Running validation... ")
@@ -254,6 +245,12 @@ def main(args):
         num_warmup_steps=args.lr_warmup_steps,
         num_training_steps=args.epochs*len(dataloader),
     )
+    # new 4.3 StepFuse Scheduler
+    stepfuse_scheduler = StepFuseScheduler(
+        method=args.stepfuse_method,
+        total_epochs=args.epochs,
+        stepfuse_args=args.stepfuse_args
+    )
     
     start_epoch = 0 
     
@@ -304,6 +301,9 @@ def main(args):
     for epoch in range(start_epoch+1, args.epochs+1):
         epoch_loss = 0.
         epoch_batches = 0
+        # calculate stepfuse coeff per epoch
+        stepfuse_scheduler.update_c_t(epoch)
+        
         for step, batch in enumerate(dataloader):
             # 1. Load and process the image and text conditioning
             x = batch["image"].to(accelerator.device)
@@ -426,60 +426,11 @@ def main(args):
                 x_prev_teacher = solver.ddim_step(pred_x0, pred_noise, index)
                 
                 # new! 7.5 adaptive x_prev.
-                # use teacher model's prediction more in early epochs, ODE more in late epochs.
+                # use teacher model's prediction more in early epochs, ODE more in later epochs.
                 x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon) 
                 
-                # args.stepfuse_method == "only_teacher":
-                c_t = 1
-                c_ode = 0
-                
-                if args.stepfuse_method == "piecewise_linear":
-                    assert args.piecewise_segments is not None, "args.piecewise_segments shouldn't be empty."
-                    piecewise_dict = ArgsStringToDict(args.piecewise_segments)
-                    # args.piecewise_segments may look like ["0.2:0.6", "0.5:0.3", "0.7:0.2", "0.9:0.1"]
-                    # and c_t will be 1 at the beginning of the training epoch, 
-                    # decreasing gradually to 0.6 at 20% of the epochs,
-                    # 0.3 at 50% of the epochs, 0.2 at 70% of the epochs, 0.1 at 90%, finally 0 at last epochs.
-                    
-                    segments_keys = sorted(piecewise_dict.keys())
-                    segments_values = [piecewise_dict[k] for k in segments_keys]
-                    # Add start (1.0) and end (0.0) points
-                    segments_keys = [0.0] + segments_keys
-                    segments_values = [1.0] + segments_values
-                    
-                    # Compute the current progress ratio
-                    progress = (epoch - (start_epoch)) / (args.epochs - start_epoch)
-                    # Find the current segment
-                    for i in range(len(segments_keys) - 1):
-                        if segments_keys[i] <= progress < segments_keys[i + 1]:
-                            # Compute linear interpolation in the current segment
-                            c_t = segments_values[i] + (segments_values[i + 1] - segments_values[i]) * \
-                                  (progress - segments_keys[i]) / (segments_keys[i + 1] - segments_keys[i])
-                            c_ode = 1 - c_t
-                            break
-                        else:
-                            c_t = segments_values[-1]
-                
-                # elif args.stepfuse_method == "sigmoid":
-                    # current_epochs = np.arange(total_epochs)
-                    # k = 0.05  # Steepness of the curve
-                    # m = total_epochs // 1.6  # Midpoint of the transition
-                    # c_start = 1  # Initial value of c_ode
-                    # c_end = 0.1  # Final value of c_ode
-
-                    # # Sigmoid-based curve
-                    # curve = 1 / (1 + np.exp(-k * (current_epochs - m)))
-                    # c_ode = c_end + (c_start - c_end) * curve
-                    # c_t = 1 - c_ode 
-                    
-                elif args.stepfuse_method == "only_ode":
-                    c_ode = 1
-                    c_t = 0
-                    
-                # elif args.stepfuse_method == "only_teacher":    
-                #    c_ode = 0
-                #    c_t = 1                  
-                    
+                c_t = stepfuse_scheduler.get_c_t()
+                c_ode = 1 - c_t
                 x_prev = c_t * x_prev_teacher + c_ode * x_prev_ode
             
             # 8. Get target LCM prediction on x_prev, w, c, t_n (timesteps)
@@ -530,23 +481,30 @@ def main(args):
                 global_step += 1
             
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch}
+            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch, "stepfuse_c_t": c_t}
             progress_bar.set_postfix(**logs)
             #accelerator.log(logs, step=global_step)
             if not args.debug:
                 accelerator.log(logs)
-            if global_step >= max_train_steps:
+            else:
+                print(logs)
+                
+            if global_step >= max_train_steps or args.debug:
                 break
-
+            
         
         # one epoch done
         if accelerator.is_main_process:
+            avg_loss = epoch_loss / epoch_batches
+            
             if not args.debug:
                 accelerator.log({"avg_loss": avg_loss})
+            else:
+                print("avg_loss", avg_loss)
+                
             save_root = os.path.join('checkpoints', args.exp, args.save_path)
             os.makedirs(save_root, exist_ok=True)
-            avg_loss = epoch_loss / epoch_batches
-
+            
             # log evaluation images to wandb
             # if global_step % args.eval_interval == 0:
             if epoch % args.eval_interval == 0:
@@ -593,16 +551,16 @@ def main(args):
 
                 # not resume or epoch is < 3/4 of total epochs    
                 else:
-                    torch.save({
-                        'epoch': epoch,
-                        'model': unet.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        "loss" : avg_loss
-                        }, 
-                        os.path.join(save_root, f"unet_{epoch}.pth")
-                    )
-                    logger.info(f"unet_{epoch}.pth saved to {save_root}")
-                    if not args.debug:    
+                    if not args.debug:
+                        torch.save({
+                            'epoch': epoch,
+                            'model': unet.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            "loss" : avg_loss
+                            }, 
+                            os.path.join(save_root, f"unet_{epoch}.pth")
+                        )
+                        logger.info(f"unet_{epoch}.pth saved to {save_root}")    
                         accelerator.log({"Ckpt_saved?": 1})
 
                 # accelerator.save_state(save_root)
@@ -683,8 +641,8 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoints_total_limit", type=int, default=8, help="Max number of checkpoints to store.")
     parser.add_argument('--eval_interval', type=int, default=2, help="Run validation every X epochs")
    # ----Latent Consistency Distillation (LCD) Specific Arguments----
-    parser.add_argument("--stepfuse_method", type=str, default="piecewise_linear", choices=["piecewise_linear", "only_ode", "only_teacher", "sigmoid", "exponential"])
-    parser.add_argument("--piecewise_segments", type=str, nargs="+", help="Piecewise linear segments in key:value string format.")
+    parser.add_argument("--stepfuse_method", type=str, default="piecewise", choices=["piecewise", "only_ode", "only_teacher", "sigmoid", "exponential"])
+    parser.add_argument("--stepfuse_args", type=str, nargs='+' ,help="if Piecewise, key:value string format.")
     # parser.add_argument("--", type=, default=)
     
     parser.add_argument("--w_interval", nargs=2, type=float, default=[2.6, 3.0], help="The interval of w for guidance scale sampling when training")

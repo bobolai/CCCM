@@ -19,6 +19,85 @@ import torch.utils.checkpoint
 import torchvision.transforms.functional as TF
 
 
+def args_string_to_dict(dict_stepfuse_args):
+    """  ['0.25:0.6', '0.5:0.3', '0.75:0.1'] to {0.25: 0.6, 0.5: 0.3, 0.75: 0.1} """
+    segment_dict = {}
+    for segment in dict_stepfuse_args:
+        key, value = segment.split(":")
+        segment_dict[float(key)] = float(value)
+        
+    return segment_dict
+
+class StepFuseScheduler:
+    def __init__(self, method, total_epochs, stepfuse_args=None):
+        """ piecewise_dict example: 
+            {0:0.5} for 0.5 constant c_t.
+            {1:0} for fully linear decreasing c_t.
+            {0.2:0.5, 0.8:0.1} will gradually decreases to 0.5 at 20% epochs, 0.1 at 80%, and maintain 0.1.
+        """
+        self.method = method
+        self.total_epochs = total_epochs
+        
+        # parse stepfuse_args based on method
+        if self.method == "piecewise":
+            try:
+                self.piecewise_dict = args_string_to_dict(stepfuse_args)
+            except ValueError as err:
+                raise ValueError("For stepwise method, args.stepfuse_args should be a dict in str. Ex:'0.2:0.5'\n" + err.args[0]) from None
+            self.decay_rate = None
+
+        elif self.method == "exponential":
+            assert len(stepfuse_args) == 1, "For exponential method, args.stepfuse_args should be a float for decay rate"
+            self.decay_rate = float(stepfuse_args[0])
+            self.piecewise_dict = None
+            
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+        self._current_c_t = 1.0  # Default to 1 at the beginning
+
+    def update_c_t(self, current_epoch):
+        """ compute c_t once per epoch"""
+        assert current_epoch <= self.total_epochs, "current_epoch > total_epochs?"
+        progress = current_epoch / self.total_epochs
+
+        if self.method == "piecewise":
+            self._current_c_t = self._compute_piecewise(progress)
+        elif self.method == "exponential":
+            self._current_c_t = self._compute_exponential(progress)
+        else:
+            raise ValueError(f"Unsupported stepfuse_method: {self.method}")
+
+    def _compute_piecewise(self, progress):
+        """ compute c_t with piecewise linear"""
+        segments_keys = sorted(self.piecewise_dict.keys())
+        segments_values = [self.piecewise_dict[k] for k in segments_keys]
+        # Add start (1.0) points
+        segments_keys = [0.0] + segments_keys
+        segments_values = [1.0] + segments_values
+
+        # Find the current segment
+        for i in range(len(segments_keys) - 1):
+            if segments_keys[i] <= progress < segments_keys[i + 1]:
+                # Compute linear interpolation in the current segment
+                c_t = segments_values[i] + (segments_values[i + 1] - segments_values[i]) * \
+                      (progress - segments_keys[i]) / (segments_keys[i + 1] - segments_keys[i])
+                c_t = round(c_t, 4)
+                break
+            else:
+                c_t = segments_values[-1]
+        return c_t
+
+    def _compute_exponential(self, progress):
+        """ compute c_t with exponential decay. """
+        c_t = math.exp(-self.decay_rate * progress)
+        c_t = c_t * (1 - progress)
+        return c_t
+    
+    def get_c_t(self):
+        """ get c_t of current epoch，used for each step(batch)."""
+        return self._current_c_t
+
+
 @torch.no_grad()
 def update_ema(target_params, source_params, rate=0.99):
     """
