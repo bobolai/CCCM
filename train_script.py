@@ -62,7 +62,7 @@ def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weig
     if args.seed is None:
         generator = None
     else:
-        generator = torch.Generator(device=device).manual_seed(args.seed)        
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)        
 
     # create conditions of each class
     # create conditions like [0,0,0,1,1,1, ...] [0,1,2,3,0,1,2,3, ...]
