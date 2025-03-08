@@ -141,7 +141,7 @@ def main(args):
             tracker_config = {
                 "architecture": args.arch,
                 "dataset": args.data.split('/')[-1],
-                "stepfuse_method": args.stepfuse_method,
+                "fuse_schedule": args.fuse_schedule,
                 "img_size": args.img_size,
                 "global_batch_size": global_batch_size,
                 "learning_rate": args.lr,
@@ -149,7 +149,8 @@ def main(args):
                 "dataset_nums_cond": args.dataset_nums_cond,
                 "pretrained_nums_cond": args.pretrained_nums_cond,
                 "guidance_scale_interval": args.w_interval,
-                "num_ddim_timesteps": args.num_ddim_timesteps
+                "num_ddim_timesteps": args.num_ddim_timesteps,
+                "seed": args.seed,
             }
             accelerator.init_trackers(args.exp, config=tracker_config)
         
@@ -252,9 +253,9 @@ def main(args):
     )
     # new 4.3 StepFuse Scheduler
     stepfuse_scheduler = StepFuseScheduler(
-        method=args.stepfuse_method,
+        method=args.fuse_schedule,
         total_epochs=args.epochs,
-        stepfuse_args=args.stepfuse_args
+        stepfuse_args=args.fuse_args
     )
     
     start_epoch = 0 
@@ -300,7 +301,7 @@ def main(args):
     logger.info("***** Running training *****")
     logger.info(f"  Num batches each epoch = {len(dataloader)}")
     logger.info(f"  Num Epochs = {args.epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Global batch size = {global_batch_size}")
     logger.info(f"  Total optimization steps = {max_train_steps}")
     
     for epoch in range(start_epoch+1, args.epochs+1):
@@ -507,28 +508,30 @@ def main(args):
                         )
                         c_t = stepfuse_scheduler.get_c_t()
                         loss = c_t * loss_teacher + (1-c_t) * loss_ode
+                    
+                    if args.debug:
+                        print("dual_consistency done")
                 
-                """
-                elif args.loss_fuse == "single_consistency": # epsilon and 1 consistency loss
-                    if args.loss_type == "l2":
-                        loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                        loss_real = F.mse_loss(model_pred.float(), x.float(), reduction="mean")
-                        c_t = stepfuse_scheduler.get_c_t()
-                        loss = c_t * loss_teacher + (1-c_t) * loss_real
+#                 elif args.loss_fuse == "single_consistency": # epsilon and 1 consistency loss
+#                     if args.loss_type == "l2":
+#                         loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+#                         loss_real = F.mse_loss(model_pred.float(), x.float(), reduction="mean")
+#                         c_t = stepfuse_scheduler.get_c_t()
+#                         loss = c_t * loss_teacher + (1-c_t) * loss_real
                         
-                    elif args.loss_type == "huber":
-                        loss_teacher = torch.mean(
-                            torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
-                        )
-                        loss_real = torch.mean(
-                            torch.sqrt((model_pred.float() - x.float()) ** 2 + args.huber_c**2) - args.huber_c
-                        )
-                        c_t = stepfuse_scheduler.get_c_t()
-                        loss = c_t * loss_teacher + (1-c_t) * loss_real
+#                     elif args.loss_type == "huber":
+#                         loss_teacher = torch.mean(
+#                             torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
+#                         )
+#                         loss_real = torch.mean(
+#                             torch.sqrt((model_pred.float() - x.float()) ** 2 + args.huber_c**2) - args.huber_c
+#                         )
+#                         c_t = stepfuse_scheduler.get_c_t()
+#                         loss = c_t * loss_teacher + (1-c_t) * loss_real
                 
-                # elif args.loss_fuse == "tri"
+#                 # elif args.loss_fuse == "tri"
                    
-                """
+                
                 else: # No loss fusion
                     if args.loss_type == "l2":
                         loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
@@ -536,7 +539,8 @@ def main(args):
                         loss = torch.mean(
                             torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
                         )
-                        
+                    if args.debug:
+                        print("stepfuse loss done")                        
                 
                 # 10. Backpropagate on the online student model (`unet`)
                 accelerator.backward(loss)
