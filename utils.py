@@ -51,6 +51,14 @@ class StepFuseScheduler:
             self.decay_rate = float(stepfuse_args[0])
             self.piecewise_dict = None
             
+        elif self.method == "only_teacher":
+            self.piecewise_dict = None
+            self.decay_rate = None
+            
+        elif self.method == "only_ode":
+            self.piecewise_dict = None
+            self.decay_rate = None
+            
         else:
             raise ValueError(f"Unsupported method: {method}")
         self._current_c_t = 1.0  # Default to 1 at the beginning
@@ -64,6 +72,10 @@ class StepFuseScheduler:
             self._current_c_t = self._compute_piecewise(progress)
         elif self.method == "exponential":
             self._current_c_t = self._compute_exponential(progress)
+        elif self.method == "only_teacher":
+            self._current_c_t = 1.0
+        elif self.method == "only_ode":
+            self._current_c_t = 0.0
         else:
             raise ValueError(f"Unsupported stepfuse_method: {self.method}")
 
