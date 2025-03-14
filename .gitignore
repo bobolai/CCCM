@@ -33,6 +33,7 @@ Thumbs.db
 .ipynb_checkpoints/
 consistency_distillation.ipynb
 train_lcm_distill_sd_wds.ipynb
+sample.ipynb
 LCMStest.ipynb
 # Pipenv Poetry 
 Pipfile

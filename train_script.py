@@ -380,22 +380,24 @@ def main(args):
                         c1,
                         c2,
                     )
-                    cond_pred_x0 = get_predicted_original_sample(
-                        cond_teacher_output,
-                        start_timesteps,
-                        noisy_model_input,
-                        noise_scheduler.config.prediction_type,
-                        noise_scheduler.alpha_schedule,
-                        noise_scheduler.sigma_schedule,
-                    )
-                    cond_pred_noise = get_predicted_noise(
-                        cond_teacher_output,
-                        start_timesteps,
-                        noisy_model_input,
-                        noise_scheduler.config.prediction_type,
-                        noise_scheduler.alpha_schedule,
-                        noise_scheduler.sigma_schedule,
-                    )
+                    if not args.teacher_real_x0:
+                        cond_pred_x0 = get_predicted_original_sample(
+                            cond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            noise_scheduler.alpha_schedule,
+                            noise_scheduler.sigma_schedule,
+                        )
+                        
+#                     cond_pred_noise = get_predicted_noise(
+#                         cond_teacher_output,
+#                         start_timesteps,
+#                         noisy_model_input,
+#                         noise_scheduler.config.prediction_type,
+#                         noise_scheduler.alpha_schedule,
+#                         noise_scheduler.sigma_schedule,
+#                     )
                     
 
                     # 7.2 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
@@ -406,35 +408,38 @@ def main(args):
                         c2,
                         force_drop_ids=True,
                     )
-                    uncond_pred_x0 = get_predicted_original_sample(
-                        uncond_teacher_output,
-                        start_timesteps,
-                        noisy_model_input,
-                        noise_scheduler.config.prediction_type,
-                        noise_scheduler.alpha_schedule,
-                        noise_scheduler.sigma_schedule,
-                    )
-                    uncond_pred_noise = get_predicted_noise(
-                        uncond_teacher_output,
-                        start_timesteps,
-                        noisy_model_input,
-                        noise_scheduler.config.prediction_type,
-                        noise_scheduler.alpha_schedule,
-                        noise_scheduler.sigma_schedule,
-                    )
+                    if not args.teacher_real_x0:
+                        uncond_pred_x0 = get_predicted_original_sample(
+                            uncond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            noise_scheduler.alpha_schedule,
+                            noise_scheduler.sigma_schedule,
+                        )
+                        
+#                     uncond_pred_noise = get_predicted_noise(
+#                         uncond_teacher_output,
+#                         start_timesteps,
+#                         noisy_model_input,
+#                         noise_scheduler.config.prediction_type,
+#                         noise_scheduler.alpha_schedule,
+#                         noise_scheduler.sigma_schedule,
+#                     )
         
                     # 7.3 Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
                     # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
-                    pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
-                    pred_noise = cond_pred_noise + w * (cond_pred_noise - uncond_pred_noise)
+                    if args.teacher_real_x0:
+                        pred_x0 = x
+                    else:
+                        pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
+                        
+                    pred_noise = cond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
                     # 7.4 Run one step of the ODE solver to estimate the next point x_prev on the
                     # augmented PF-ODE trajectory (solving backward in time)
-                    # Note that the DDIM step depends on both the predicted x_0 and source noise eps_0.
                     x_prev_teacher = solver.ddim_step(pred_x0, pred_noise, index)
-                    # x_prev_teacher = solver.ddim_step(pred_x0, pred_noise, index)
-                    
-                    
-                    # new! 7.5 adaptive x_prev.
+                      
+                    # new! 7.5 fuse x_prev.
                     # use teacher model's prediction more in early epochs, ODE more in later epochs.
                     if args.loss_fuse == "None":
                         # use step fusion, not loss fusion
@@ -471,46 +476,75 @@ def main(args):
                         # generate x_prev_ode with ddim deterministic formulation                   
                         x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon)
                         # predict x_prev_ode with EMA_unet for consistency objective
-                        pred_noise_ode = target_unet(
-                            x_prev_ode.float(),
-                            timesteps,
-                            c1,
-                            c2,
-                            timestep_cond=w_embedding,
-                        )
+                        
+                        # for debugging
+                        if stepfuse_scheduler.method != "only_teacher":    
+                            pred_noise_ode = target_unet(
+                                x_prev_ode.float(),
+                                timesteps,
+                                c1,
+                                c2,
+                                timestep_cond=w_embedding,
+                            )
 
-                        _pred_x0_ode = get_predicted_original_sample(
-                            pred_noise_ode,
-                            timesteps,
-                            x_prev_ode,
-                            noise_scheduler.config.prediction_type,
-                            noise_scheduler.alpha_schedule,
-                            noise_scheduler.sigma_schedule,
-                        )
+                            _pred_x0_ode = get_predicted_original_sample(
+                                pred_noise_ode,
+                                timesteps,
+                                x_prev_ode,
+                                noise_scheduler.config.prediction_type,
+                                noise_scheduler.alpha_schedule,
+                                noise_scheduler.sigma_schedule,
+                            )
 
-                        pred_x0_ode = c_skip * x_prev_ode + c_out * _pred_x0_ode
+                            pred_x0_ode = c_skip * x_prev_ode + c_out * _pred_x0_ode
                 
                 # new 9. Calculate loss with Loss Fusion
                 #  
                 if args.loss_fuse == "dual_consistency": # 2 consistency losses
                     if args.loss_type == "l2":
-                        loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                        loss_ode = F.mse_loss(model_pred.float(), pred_x0_ode.float(), reduction="mean")
+                        # for debugging
+                        if stepfuse_scheduler.method == "only_teacher":
+                            loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                            loss_ode = 0
+                        elif stepfuse_scheduler.method == "only_ode":
+                            loss_teacher = 0
+                            loss_ode = F.mse_loss(model_pred.float(), pred_x0_ode.float(), reduction="mean")
+                        else:
+                            loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                            loss_ode = F.mse_loss(model_pred.float(), pred_x0_ode.float(), reduction="mean")
+                            
                         c_t = stepfuse_scheduler.get_c_t()
                         loss = c_t * loss_teacher + (1-c_t) * loss_ode
                         
                     elif args.loss_type == "huber":
-                        loss_teacher = torch.mean(
-                            torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
-                        )
-                        loss_ode = torch.mean(
-                            torch.sqrt((model_pred.float() - pred_x0_ode.float()) ** 2 + args.huber_c**2) - args.huber_c
-                        )
+                        if stepfuse_scheduler.method == "only_teacher":
+                            loss_teacher = torch.mean(
+                                torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
+                            )
+                            loss_ode = 0
+                            
+                        elif stepfuse_scheduler.method == "only_ode":
+                            loss_teacher = 0 
+                            loss_ode = torch.mean(
+                                torch.sqrt((model_pred.float() - pred_x0_ode.float()) ** 2 + args.huber_c**2) - args.huber_c
+                            )
+                        else:
+                            loss_teacher = torch.mean(
+                                torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
+                            )
+                            loss_ode = torch.mean(
+                                torch.sqrt((model_pred.float() - pred_x0_ode.float()) ** 2 + args.huber_c**2) - args.huber_c
+                            )
+                            
                         c_t = stepfuse_scheduler.get_c_t()
                         loss = c_t * loss_teacher + (1-c_t) * loss_ode
                     
-                    if args.debug:
+                    if args.debug and accelerator.is_main_process:
                         print("dual_consistency done")
+                        print("method=", stepfuse_scheduler.method)
+                        print("loss_teacher=", loss_teacher)
+                        print("loss_ode=", loss_ode)
+                        print("loss=", loss)
                 
 #                 elif args.loss_fuse == "single_consistency": # epsilon and 1 consistency loss
 #                     if args.loss_type == "l2":
@@ -712,18 +746,23 @@ if __name__ == "__main__":
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     # ----Learning Rate----
     parser.add_argument('--lr', type=float, default=5e-6, help="learning rate")
-    parser.add_argument('--lr_schedule', type=str, default="constant_with_warmup", choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
-            help=(
-            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
-        ),)
+    parser.add_argument('--lr_schedule', type=str, default="constant_with_warmup", 
+                        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+                        help=("The scheduler type to use. Choose between ['linear', 'cosine',"+ 
+                              "'cosine_with_restarts', 'polynomial', 'constant', 'constant_with_warmup']")
+                       )
     parser.add_argument("--lr_warmup_steps", type=int, default=500, help="warmup steps for lr scheduler.")
     # ----Checkpoint and Eval----
-    parser.add_argument("--checkpoint_interval", type=int, default=2, help="how many epochs per checkpoint saved")
-    parser.add_argument("--checkpoints_total_limit", type=int, default=8, help="Max number of checkpoints to store.")
-    parser.add_argument('--eval_interval', type=int, default=2, help="Run validation every X epochs")
+    parser.add_argument("--checkpoint_interval", type=int, default=2, 
+                        help="how many epochs per checkpoint saved.")
+    parser.add_argument("--checkpoints_total_limit", type=int, default=8, 
+                        help="Max number of checkpoints to store.")
+    parser.add_argument('--eval_interval', type=int, default=2, 
+                        help="Run validation every X epochs.")
     ###
     # ----Latent Consistency Distillation (LCD) Specific Arguments----
+    parser.add_argument("--teacher_real_x0", action="store_true", 
+                        help="use real x0 instead of predicted x0 by teacher model when generating teacher_xprev")
     parser.add_argument("--fuse_schedule", type=str, default="piecewise", choices=["piecewise", "only_ode", "only_teacher", "exponential"])
     parser.add_argument("--fuse_args", type=str, nargs='+' ,help="if Piecewise, key:value string format.")
     parser.add_argument("--loss_fuse", type=str, default="dual_consistency", choices=["uni_consistency", "dual_consistency", "None"],
