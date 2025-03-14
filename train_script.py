@@ -109,8 +109,8 @@ def main(args):
     
     logging_dir = Path(args.save_path, args.logging_dir)
     # accelerator_project_config = ProjectConfiguration(project_dir=args.save_path, logging_dir=logging_dir)
-    if args.gradient_accumulation_steps == 1 and args.train_batch_size <= 8:
-        args.gradient_accumulation_steps = 2 
+    # if args.gradient_accumulation_steps == 1 and args.train_batch_size <= 8:
+    #     args.gradient_accumulation_steps = 2 
     
     accelerator = Accelerator(log_with="wandb", gradient_accumulation_steps=args.gradient_accumulation_steps)
     
@@ -179,8 +179,9 @@ def main(args):
 
     # Load model parameters (with strict=False to allow some missing or extra keys)
     missing_keys, unexpected_keys = teacher_unet.load_state_dict(new_ckpt, strict=False)
-    print("Teacher Missing keys:", missing_keys)
-    print("Teacehr Unexpected keys:", unexpected_keys)
+    if accelerator.is_main_process:
+        print("Teacher Missing keys:", missing_keys)
+        print("Teacehr Unexpected keys:", unexpected_keys)
 
     # Manually assign weights for special cases
     for i in range(len(missing_keys)):
