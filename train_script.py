@@ -373,104 +373,92 @@ def main(args):
                 # predicted noise eps_0 and predicted original sample x_0, then run the ODE solver using these
                 # estimates to predict the data point in the augmented PF-ODE trajectory corresponding to the next ODE
                 # solver timestep.
+                 
                 with torch.no_grad():
-                    # 7.1 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and conditional embedding c
-                    cond_teacher_output = teacher_unet(
-                        noisy_model_input,
-                        start_timesteps,
-                        c1,
-                        c2,
-                    )
-                    if not args.teacher_real_x0:
-                        cond_pred_x0 = get_predicted_original_sample(
-                            cond_teacher_output,
-                            start_timesteps,
+                    if stepfuse_scheduler.method != "only_ode":
+                        # 7.1 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and conditional embedding c
+                        cond_teacher_output = teacher_unet(
                             noisy_model_input,
-                            noise_scheduler.config.prediction_type,
-                            noise_scheduler.alpha_schedule,
-                            noise_scheduler.sigma_schedule,
+                            start_timesteps,
+                            c1,
+                            c2,
                         )
-                        
-#                     cond_pred_noise = get_predicted_noise(
-#                         cond_teacher_output,
-#                         start_timesteps,
-#                         noisy_model_input,
-#                         noise_scheduler.config.prediction_type,
-#                         noise_scheduler.alpha_schedule,
-#                         noise_scheduler.sigma_schedule,
-#                     )
-                    
+                        if not args.teacher_real_x0:
+                            cond_pred_x0 = get_predicted_original_sample(
+                                cond_teacher_output,
+                                start_timesteps,
+                                noisy_model_input,
+                                noise_scheduler.config.prediction_type,
+                                noise_scheduler.alpha_schedule,
+                                noise_scheduler.sigma_schedule,
+                            )
 
-                    # 7.2 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
-                    uncond_teacher_output = teacher_unet(
-                        noisy_model_input,
-                        start_timesteps,
-                        c1,
-                        c2,
-                        force_drop_ids=True,
-                    )
-                    if not args.teacher_real_x0:
-                        uncond_pred_x0 = get_predicted_original_sample(
-                            uncond_teacher_output,
-                            start_timesteps,
+                        # 7.2 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
+                        uncond_teacher_output = teacher_unet(
                             noisy_model_input,
-                            noise_scheduler.config.prediction_type,
-                            noise_scheduler.alpha_schedule,
-                            noise_scheduler.sigma_schedule,
+                            start_timesteps,
+                            c1,
+                            c2,
+                            force_drop_ids=True,
                         )
-                        
-#                     uncond_pred_noise = get_predicted_noise(
-#                         uncond_teacher_output,
-#                         start_timesteps,
-#                         noisy_model_input,
-#                         noise_scheduler.config.prediction_type,
-#                         noise_scheduler.alpha_schedule,
-#                         noise_scheduler.sigma_schedule,
-#                     )
-        
-                    # 7.3 Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
-                    # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
-                    if args.teacher_real_x0:
-                        pred_x0 = x
-                    else:
-                        pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
-                        
-                    pred_noise = cond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
-                    # 7.4 Run one step of the ODE solver to estimate the next point x_prev on the
-                    # augmented PF-ODE trajectory (solving backward in time)
-                    x_prev_teacher = solver.ddim_step(pred_x0, pred_noise, index)
+                        if not args.teacher_real_x0:
+                            uncond_pred_x0 = get_predicted_original_sample(
+                                uncond_teacher_output,
+                                start_timesteps,
+                                noisy_model_input,
+                                noise_scheduler.config.prediction_type,
+                                noise_scheduler.alpha_schedule,
+                                noise_scheduler.sigma_schedule,
+                            )
+
+                        # 7.3 Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
+                        # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
+                        if args.teacher_real_x0:
+                            pred_x0 = x
+                        else:
+                            pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
+
+                        pred_noise = cond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
+                        # 7.4 Run one step of the ODE solver to estimate the next point x_prev on the
+                        # augmented PF-ODE trajectory (solving backward in time)
+                        x_prev_teacher = solver.ddim_step(pred_x0, pred_noise, index)
                       
-                    # new! 7.5 fuse x_prev.
-                    # use teacher model's prediction more in early epochs, ODE more in later epochs.
-                    if args.loss_fuse == "None":
-                        # use step fusion, not loss fusion
-                        x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon) # timesteps = start_timesteps - topk
-                        c_t = stepfuse_scheduler.get_c_t()
-                        c_ode = 1 - c_t
-                        x_prev = c_t * x_prev_teacher + c_ode * x_prev_ode
-                    else:
-                        x_prev = x_prev_teacher
+                        # new! 7.5 fuse x_prev.
+                        # use teacher model's prediction more in early epochs, ODE more in later epochs.
+                        if args.loss_fuse == "None":
+                            # use step fusion, not loss fusion
+                            x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon) # timesteps = start_timesteps - topk
+                            c_t = stepfuse_scheduler.get_c_t()
+                            c_ode = 1 - c_t
+                            x_prev = c_t * x_prev_teacher + c_ode * x_prev_ode
+                        else:
+                            x_prev = x_prev_teacher
                     
+                
                 # 8. Get target LCM prediction on x_prev, w, c, t_n (timesteps)
                 with torch.no_grad():
-                    target_pred_noise = target_unet(
-                        x_prev.float(),
-                        timesteps,
-                        c1,
-                        c2,
-                        timestep_cond=w_embedding,
-                    )
-                    
-                    pred_x0 = get_predicted_original_sample(
-                        target_pred_noise,
-                        timesteps,
-                        x_prev,
-                        noise_scheduler.config.prediction_type,
-                        noise_scheduler.alpha_schedule,
-                        noise_scheduler.sigma_schedule,
-                    )
-                    
-                    target = c_skip * x_prev + c_out * pred_x0
+                    if stepfuse_scheduler.method != "only_ode":
+                        if args.debug and accelerator.is_main_process:
+                            print("NOT only_ode")
+                            
+                        target_pred_noise = target_unet(
+                            x_prev.float(),
+                            timesteps,
+                            c1,
+                            c2,
+                            timestep_cond=w_embedding,
+                        )
+
+                        pred_x0 = get_predicted_original_sample(
+                            target_pred_noise,
+                            timesteps,
+                            x_prev,
+                            noise_scheduler.config.prediction_type,
+                            noise_scheduler.alpha_schedule,
+                            noise_scheduler.sigma_schedule,
+                        )
+
+                        target = c_skip * x_prev + c_out * pred_x0
                     
                     ###
                     if args.loss_fuse == "dual_consistency":
@@ -479,7 +467,10 @@ def main(args):
                         # predict x_prev_ode with EMA_unet for consistency objective
                         
                         # for debugging
-                        if stepfuse_scheduler.method != "only_teacher":    
+                        if stepfuse_scheduler.method != "only_teacher":
+                            if args.debug and accelerator.is_main_process:
+                                print("NOT only_teacher")
+                                
                             pred_noise_ode = target_unet(
                                 x_prev_ode.float(),
                                 timesteps,
