@@ -383,15 +383,14 @@ def main(args):
                             c1,
                             c2,
                         )
-                        if not args.teacher_real_x0:
-                            cond_pred_x0 = get_predicted_original_sample(
-                                cond_teacher_output,
-                                start_timesteps,
-                                noisy_model_input,
-                                noise_scheduler.config.prediction_type,
-                                noise_scheduler.alpha_schedule,
-                                noise_scheduler.sigma_schedule,
-                            )
+                        cond_pred_x0 = get_predicted_original_sample(
+                            cond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            noise_scheduler.alpha_schedule,
+                            noise_scheduler.sigma_schedule,
+                        )
 
                         # 7.2 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
                         uncond_teacher_output = teacher_unet(
@@ -401,22 +400,18 @@ def main(args):
                             c2,
                             force_drop_ids=True,
                         )
-                        if not args.teacher_real_x0:
-                            uncond_pred_x0 = get_predicted_original_sample(
-                                uncond_teacher_output,
-                                start_timesteps,
-                                noisy_model_input,
-                                noise_scheduler.config.prediction_type,
-                                noise_scheduler.alpha_schedule,
-                                noise_scheduler.sigma_schedule,
-                            )
+                        uncond_pred_x0 = get_predicted_original_sample(
+                            uncond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            noise_scheduler.alpha_schedule,
+                            noise_scheduler.sigma_schedule,
+                        )
 
                         # 7.3 Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
                         # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
-                        if args.teacher_real_x0:
-                            pred_x0 = x
-                        else:
-                            pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
+                        pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
 
                         pred_noise = cond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
                         # 7.4 Run one step of the ODE solver to estimate the next point x_prev on the
@@ -753,8 +748,6 @@ if __name__ == "__main__":
                         help="Run validation every X epochs.")
     ###
     # ----Latent Consistency Distillation (LCD) Specific Arguments----
-    parser.add_argument("--teacher_real_x0", action="store_true", 
-                        help="use real x0 instead of predicted x0 by teacher model when generating teacher_xprev")
     parser.add_argument("--fuse_schedule", type=str, default="piecewise", choices=["piecewise", "only_ode", "only_teacher", "exponential"])
     parser.add_argument("--fuse_args", type=str, nargs='+' ,help="if Piecewise, key:value string format.")
     parser.add_argument("--loss_fuse", type=str, default="dual_consistency", choices=["uni_consistency", "dual_consistency", "None"],
