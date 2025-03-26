@@ -6,6 +6,7 @@ from tqdm import tqdm
 import numpy as np
 import math
 from diffusers.schedulers import LCMScheduler
+from diffusers.utils.torch_utils import randn_tensor
 
 def extract(v, i, shape):
     """
@@ -679,11 +680,11 @@ class ConsisctencySampler(nn.Module):
         if x_t is None:
             if generator is None:
                 print("No noise or seed provided for sampler, going to sample random noises.")
-            x_t = randn_tensor(x_shape, generator=generator, device=self.device, dtype=torch.float32)
+            x_t = randn_tensor(self.x_shape, generator=generator, device=self.device, dtype=torch.float32)
             x_t = x_t * self.scheduler.init_noise_sigma
         
         else:
-            x_t = randn_tensor(x_shape, generator=generator, device=self.device, dtype=torch.float32) if generator else x_t
+            x_t = randn_tensor(self.x_shape, generator=generator, device=self.device, dtype=torch.float32) if generator else x_t
             
         
         bs = self.x_shape[0] * num_images_per_cond

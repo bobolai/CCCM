@@ -47,19 +47,10 @@ from models.unet import Swish, UpSample, DownSample, AdaGroupNorm, TimestepEmbed
 from models.unet import UNet
 from utils import DDIMSolver, update_ema, guidance_scale_embedding, append_dims, extract, set_seed, load_checkpoint
 from utils import scalings_for_boundary_conditions, get_predicted_original_sample, get_predicted_noise, get_ddim_timesteps
+from utils import StepFuseScheduler
 from utils_ccdm import get_model
 
 logger = get_logger(__name__)
-
-
-def ArgsStringToDict(args_):
-    """  ['0.25:0.6', '0.5:0.3', '0.75:0.1'] to {0.25: 0.6, 0.5: 0.3, 0.75: 0.1} """
-    segment_dict = {}
-    for segment in args_:
-        key, value = segment.split(":")
-        segment_dict[float(key)] = float(value)
-    return segment_dict
-
 
 def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weight_dtype=torch.float32, name="target"):
     logger.info("Running validation... ")
@@ -71,7 +62,7 @@ def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weig
     if args.seed is None:
         generator = None
     else:
-        generator = torch.Generator(device=device).manual_seed(args.seed)        
+        generator = torch.Generator(device=accelerator.device).manual_seed(args.seed)        
 
     # create conditions of each class
     # create conditions like [0,0,0,1,1,1, ...] [0,1,2,3,0,1,2,3, ...]
@@ -117,9 +108,12 @@ def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weig
 def main(args):
     
     logging_dir = Path(args.save_path, args.logging_dir)
-    # accelerator_project_config = ProjectConfiguration(project_dir=args.save_path, logging_dir=logging_dir)   
+    # accelerator_project_config = ProjectConfiguration(project_dir=args.save_path, logging_dir=logging_dir)
+    # if args.gradient_accumulation_steps == 1 and args.train_batch_size <= 8:
+    #     args.gradient_accumulation_steps = 2 
     
-    accelerator = Accelerator(log_with="wandb")
+    accelerator = Accelerator(log_with="wandb", gradient_accumulation_steps=args.gradient_accumulation_steps)
+    
     # Make one log on every process with the configuration for debugging.
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
@@ -140,20 +134,23 @@ def main(args):
     if args.dataset_nums_cond is None:
         args.dataset_nums_cond = args.pretrained_nums_cond
         
+    global_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps    
+    
     if accelerator.is_main_process:
         if not args.debug:
             tracker_config = {
                 "architecture": args.arch,
                 "dataset": args.data.split('/')[-1],
-                "stepfuse_method": args.stepfuse_method,
+                "fuse_schedule": args.fuse_schedule,
                 "img_size": args.img_size,
-                "train_batch_size": args.train_batch_size,
+                "global_batch_size": global_batch_size,
                 "learning_rate": args.lr,
                 "epochs": args.epochs,
                 "dataset_nums_cond": args.dataset_nums_cond,
                 "pretrained_nums_cond": args.pretrained_nums_cond,
                 "guidance_scale_interval": args.w_interval,
-                "num_ddim_timesteps": args.num_ddim_timesteps
+                "num_ddim_timesteps": args.num_ddim_timesteps,
+                "seed": args.seed,
             }
             accelerator.init_trackers(args.exp, config=tracker_config)
         
@@ -182,8 +179,9 @@ def main(args):
 
     # Load model parameters (with strict=False to allow some missing or extra keys)
     missing_keys, unexpected_keys = teacher_unet.load_state_dict(new_ckpt, strict=False)
-    print("Teacher Missing keys:", missing_keys)
-    print("Teacehr Unexpected keys:", unexpected_keys)
+    if accelerator.is_main_process:
+        print("Teacher Missing keys:", missing_keys)
+        print("Teacehr Unexpected keys:", unexpected_keys)
 
     # Manually assign weights for special cases
     for i in range(len(missing_keys)):
@@ -254,6 +252,12 @@ def main(args):
         num_warmup_steps=args.lr_warmup_steps,
         num_training_steps=args.epochs*len(dataloader),
     )
+    # new 4.3 StepFuse Scheduler
+    stepfuse_scheduler = StepFuseScheduler(
+        method=args.fuse_schedule,
+        total_epochs=args.epochs,
+        stepfuse_args=args.fuse_args
+    )
     
     start_epoch = 0 
     
@@ -279,8 +283,8 @@ def main(args):
         
     unet, optimizer, lr_scheduler, dataloader = accelerator.prepare(unet, optimizer, lr_scheduler, dataloader)
     
-    #num_update_steps_per_epoch = math.ceil(len(dataloader) / args.gradient_accumulation_steps)
-    num_update_steps_per_epoch = len(dataloader)
+    num_update_steps_per_epoch = math.ceil(len(dataloader) / args.gradient_accumulation_steps)
+    # num_update_steps_per_epoch = len(dataloader)
     max_train_steps = args.epochs * num_update_steps_per_epoch
     global_step = start_epoch * num_update_steps_per_epoch
     best_loss = float('inf')
@@ -298,261 +302,317 @@ def main(args):
     logger.info("***** Running training *****")
     logger.info(f"  Num batches each epoch = {len(dataloader)}")
     logger.info(f"  Num Epochs = {args.epochs}")
-    logger.info(f"  Instantaneous batch size per device = {args.train_batch_size}")
+    logger.info(f"  Global batch size = {global_batch_size}")
     logger.info(f"  Total optimization steps = {max_train_steps}")
     
     for epoch in range(start_epoch+1, args.epochs+1):
         epoch_loss = 0.
         epoch_batches = 0
+        # calculate stepfuse coeff per epoch
+        stepfuse_scheduler.update_c_t(epoch)
+        
         for step, batch in enumerate(dataloader):
-            # 1. Load and process the image and text conditioning
-            x = batch["image"].to(accelerator.device)
-            c1 = torch.tensor([CFG.ATR2IDX[a] for a in batch["atr"]], dtype=torch.long, device=accelerator.device)
-            c2 = torch.tensor([CFG.OBJ2IDX[o] for o in batch["obj"]], dtype=torch.long, device=accelerator.device)
-            bsz = x.shape[0]
-            
-            # 2. Sample a random timestep for each image t_n from the ODE solver timesteps without bias.
-            # For the DDIM solver, the timestep schedule is [T - 1, T - k - 1, T - 2 * k - 1, ...]
-            topk = noise_scheduler.config.num_train_timesteps // args.num_ddim_timesteps
-            index = torch.randint(0, args.num_ddim_timesteps, (bsz,), device=x.device).long()
-            start_timesteps = solver.ddim_timesteps[index]
-            timesteps = start_timesteps - topk
-            timesteps = torch.where(timesteps < 0, torch.zeros_like(timesteps), timesteps)
-            
-            # 3. Get boundary scalings for start_timesteps and (end) timesteps.
-            c_skip_start, c_out_start = scalings_for_boundary_conditions(
-                start_timesteps, timestep_scaling=args.timestep_scaling_factor
-            )
-            c_skip_start, c_out_start = [append_dims(c, x.ndim) for c in [c_skip_start, c_out_start]]
-            c_skip, c_out = scalings_for_boundary_conditions(
-                timesteps, timestep_scaling=args.timestep_scaling_factor
-            )
-            c_skip, c_out = [append_dims(c, x.ndim) for c in [c_skip, c_out]]
-            
-            # 4. Sample noise from the prior and add it to the latents according to the noise magnitude at each
-            # timestep (this is the forward diffusion process) [z_{t_{n + k}} in Algorithm 1]
-            noisy_model_input, epsilon = noise_scheduler.add_noise(x, start_timesteps, return_epsilon=True)
-            
-            # 5. Sample a random guidance scale w from U[w_min, w_max] and embed it
-            w = torch.empty(bsz).uniform_(args.w_interval[0], args.w_interval[1])
-            w_embedding = guidance_scale_embedding(w, embedding_dim=args.time_cond_proj_dim)
-            w = w.reshape(bsz, 1, 1, 1)
-            # Move to U-Net device and dtype
-            w = w.to(device=x.device, dtype=x.dtype)
-            w_embedding = w_embedding.to(device=x.device, dtype=x.dtype)
-            
-            # 6. Get online LCM prediction on z_{t_{n + k}} (noisy_model_input), w, c, t_{n + k} (start_timesteps)
-            noise_pred = unet(
-                noisy_model_input,
-                start_timesteps,
-                c1,
-                c2,
-                timestep_cond=w_embedding,
-            )
-
-            pred_x0 = get_predicted_original_sample(
-                noise_pred,
-                start_timesteps,
-                noisy_model_input,
-                noise_scheduler.config.prediction_type,
-                noise_scheduler.alpha_schedule,
-                noise_scheduler.sigma_schedule,
-            )
-
-            model_pred = c_skip_start * noisy_model_input + c_out_start * pred_x0
-            
-            # 7. Compute the conditional and unconditional teacher model predictions to get CFG estimates of the
-            # predicted noise eps_0 and predicted original sample x_0, then run the ODE solver using these
-            # estimates to predict the data point in the augmented PF-ODE trajectory corresponding to the next ODE
-            # solver timestep.
-            with torch.no_grad():
-                # 7.1 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and conditional embedding c
-                cond_teacher_output = teacher_unet(
-                    noisy_model_input,
-                    start_timesteps,
-                    c1,
-                    c2,
-                )
-                cond_pred_x0 = get_predicted_original_sample(
-                    cond_teacher_output,
-                    start_timesteps,
-                    noisy_model_input,
-                    noise_scheduler.config.prediction_type,
-                    noise_scheduler.alpha_schedule,
-                    noise_scheduler.sigma_schedule,
-                )
-                cond_pred_noise = get_predicted_noise(
-                    cond_teacher_output,
-                    start_timesteps,
-                    noisy_model_input,
-                    noise_scheduler.config.prediction_type,
-                    noise_scheduler.alpha_schedule,
-                    noise_scheduler.sigma_schedule,
-                )
-
-
-                # 7.2 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
-                uncond_teacher_output = teacher_unet(
-                    noisy_model_input,
-                    start_timesteps,
-                    c1,
-                    c2,
-                    force_drop_ids=True,
-                )
-                uncond_pred_x0 = get_predicted_original_sample(
-                    uncond_teacher_output,
-                    start_timesteps,
-                    noisy_model_input,
-                    noise_scheduler.config.prediction_type,
-                    noise_scheduler.alpha_schedule,
-                    noise_scheduler.sigma_schedule,
-                )
-                uncond_pred_noise = get_predicted_noise(
-                    uncond_teacher_output,
-                    start_timesteps,
-                    noisy_model_input,
-                    noise_scheduler.config.prediction_type,
-                    noise_scheduler.alpha_schedule,
-                    noise_scheduler.sigma_schedule,
-                )
-
-                # 7.3 Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
-                # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
-                pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
-                pred_noise = cond_pred_noise + w * (cond_pred_noise - uncond_pred_noise)
-                # 7.4 Run one step of the ODE solver to estimate the next point x_prev on the
-                # augmented PF-ODE trajectory (solving backward in time)
-                # Note that the DDIM step depends on both the predicted x_0 and source noise eps_0.
-                x_prev_teacher = solver.ddim_step(pred_x0, pred_noise, index)
+            with accelerator.accumulate(unet):
+                # 1. Load and process the image and text conditioning
+                x = batch["image"].to(accelerator.device)
+                c1 = torch.tensor([CFG.ATR2IDX[a] for a in batch["atr"]], dtype=torch.long, device=accelerator.device)
+                c2 = torch.tensor([CFG.OBJ2IDX[o] for o in batch["obj"]], dtype=torch.long, device=accelerator.device)
+                bsz = x.shape[0]
                 
-                # new! 7.5 adaptive x_prev.
-                # use teacher model's prediction more in early epochs, ODE more in late epochs.
-                x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon) 
+                # 2. Sample a random timestep for each image t_n from the ODE solver timesteps without bias.
+                # For the DDIM solver, the timestep schedule is [T - 1, T - k - 1, T - 2 * k - 1, ...]
+                topk = noise_scheduler.config.num_train_timesteps // args.num_ddim_timesteps
+                index = torch.randint(0, args.num_ddim_timesteps, (bsz,), device=x.device).long()
+                start_timesteps = solver.ddim_timesteps[index]
+                timesteps = start_timesteps - topk
+                timesteps = torch.where(timesteps < 0, torch.zeros_like(timesteps), timesteps)
                 
-                # args.stepfuse_method == "only_teacher":
-                c_t = 1
-                c_ode = 0
+                # 3. Get boundary scalings for start_timesteps and (end) timesteps.
+                c_skip_start, c_out_start = scalings_for_boundary_conditions(
+                    start_timesteps, timestep_scaling=args.timestep_scaling_factor
+                )
+                c_skip_start, c_out_start = [append_dims(c, x.ndim) for c in [c_skip_start, c_out_start]]
+                c_skip, c_out = scalings_for_boundary_conditions(
+                    timesteps, timestep_scaling=args.timestep_scaling_factor
+                )
+                c_skip, c_out = [append_dims(c, x.ndim) for c in [c_skip, c_out]]
                 
-                if args.stepfuse_method == "piecewise_linear":
-                    assert args.piecewise_segments is not None, "args.piecewise_segments shouldn't be empty."
-                    piecewise_dict = ArgsStringToDict(args.piecewise_segments)
-                    # args.piecewise_segments may look like ["0.2:0.6", "0.5:0.3", "0.7:0.2", "0.9:0.1"]
-                    # and c_t will be 1 at the beginning of the training epoch, 
-                    # decreasing gradually to 0.6 at 20% of the epochs,
-                    # 0.3 at 50% of the epochs, 0.2 at 70% of the epochs, 0.1 at 90%, finally 0 at last epochs.
-                    
-                    segments_keys = sorted(piecewise_dict.keys())
-                    segments_values = [piecewise_dict[k] for k in segments_keys]
-                    # Add start (1.0) and end (0.0) points
-                    segments_keys = [0.0] + segments_keys
-                    segments_values = [1.0] + segments_values
-                    
-                    # Compute the current progress ratio
-                    progress = (epoch - (start_epoch)) / (args.epochs - start_epoch)
-                    # Find the current segment
-                    for i in range(len(segments_keys) - 1):
-                        if segments_keys[i] <= progress < segments_keys[i + 1]:
-                            # Compute linear interpolation in the current segment
-                            c_t = segments_values[i] + (segments_values[i + 1] - segments_values[i]) * \
-                                  (progress - segments_keys[i]) / (segments_keys[i + 1] - segments_keys[i])
-                            c_ode = 1 - c_t
-                            break
-                        else:
-                            c_t = segments_values[-1]
+                # 4. Sample noise from the prior and add it to the latents according to the noise magnitude at each
+                # timestep (this is the forward diffusion process) [z_{t_{n + k}} in Algorithm 1]
+                noisy_model_input, epsilon = noise_scheduler.add_noise(x, start_timesteps, return_epsilon=True)
                 
-                # elif args.stepfuse_method == "sigmoid":
-                    # current_epochs = np.arange(total_epochs)
-                    # k = 0.05  # Steepness of the curve
-                    # m = total_epochs // 1.6  # Midpoint of the transition
-                    # c_start = 1  # Initial value of c_ode
-                    # c_end = 0.1  # Final value of c_ode
-
-                    # # Sigmoid-based curve
-                    # curve = 1 / (1 + np.exp(-k * (current_epochs - m)))
-                    # c_ode = c_end + (c_start - c_end) * curve
-                    # c_t = 1 - c_ode 
-                    
-                elif args.stepfuse_method == "only_ode":
-                    c_ode = 1
-                    c_t = 0
-                    
-                # elif args.stepfuse_method == "only_teacher":    
-                #    c_ode = 0
-                #    c_t = 1                  
-                    
-                x_prev = c_t * x_prev_teacher + c_ode * x_prev_ode
-            
-            # 8. Get target LCM prediction on x_prev, w, c, t_n (timesteps)
-            with torch.no_grad():
-                target_noise_pred = target_unet(
-                    x_prev.float(),
-                    timesteps,
+                # 5. Sample a random guidance scale w from U[w_min, w_max] and embed it
+                w = torch.empty(bsz).uniform_(args.w_interval[0], args.w_interval[1])
+                w_embedding = guidance_scale_embedding(w, embedding_dim=args.time_cond_proj_dim)
+                w = w.reshape(bsz, 1, 1, 1)
+                # Move to U-Net device and dtype
+                w = w.to(device=x.device, dtype=x.dtype)
+                w_embedding = w_embedding.to(device=x.device, dtype=x.dtype)
+                
+                # 6. Get online LCM prediction on z_{t_{n + k}} (noisy_model_input), w, c, t_{n + k} (start_timesteps)
+                noise_pred = unet(
+                    noisy_model_input,
+                    start_timesteps,
                     c1,
                     c2,
                     timestep_cond=w_embedding,
                 )
-
+                
                 pred_x0 = get_predicted_original_sample(
-                    target_noise_pred,
-                    timesteps,
-                    x_prev,
+                    noise_pred,
+                    start_timesteps,
+                    noisy_model_input,
                     noise_scheduler.config.prediction_type,
                     noise_scheduler.alpha_schedule,
                     noise_scheduler.sigma_schedule,
                 )
-
-                target = c_skip * x_prev + c_out * pred_x0
                 
-            # 9. Calculate loss
-            if args.loss_type == "l2":
-                loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-            elif args.loss_type == "huber":
-                loss = torch.mean(
-                    torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
-                )
+                model_pred = c_skip_start * noisy_model_input + c_out_start * pred_x0
                 
-            # 10. Backpropagate on the online student model (`unet`)
-            accelerator.backward(loss)
-            if accelerator.sync_gradients:
-                accelerator.clip_grad_norm_(unet.parameters(), 1.0)
-            optimizer.step()
-            lr_scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
-            
-            epoch_batches += 1
-            epoch_loss += loss.item()
-            
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-            # 11. Make EMA update to target student model parameters (`target_unet`)
-                update_ema(target_unet.parameters(), unet.parameters(), args.ema_decay)
-                progress_bar.update(1)
-                global_step += 1
-            
+                # 7. Compute the conditional and unconditional teacher model predictions to get CFG estimates of the
+                # predicted noise eps_0 and predicted original sample x_0, then run the ODE solver using these
+                # estimates to predict the data point in the augmented PF-ODE trajectory corresponding to the next ODE
+                # solver timestep.
+                 
+                with torch.no_grad():
+                    if stepfuse_scheduler.method != "only_ode":
+                        # 7.1 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and conditional embedding c
+                        cond_teacher_output = teacher_unet(
+                            noisy_model_input,
+                            start_timesteps,
+                            c1,
+                            c2,
+                        )
+                        cond_pred_x0 = get_predicted_original_sample(
+                            cond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            noise_scheduler.alpha_schedule,
+                            noise_scheduler.sigma_schedule,
+                        )
 
-            logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch}
-            progress_bar.set_postfix(**logs)
-            #accelerator.log(logs, step=global_step)
-            if not args.debug:
-                accelerator.log(logs)
-            if global_step >= max_train_steps:
-                break
+                        # 7.2 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
+                        uncond_teacher_output = teacher_unet(
+                            noisy_model_input,
+                            start_timesteps,
+                            c1,
+                            c2,
+                            force_drop_ids=True,
+                        )
+                        uncond_pred_x0 = get_predicted_original_sample(
+                            uncond_teacher_output,
+                            start_timesteps,
+                            noisy_model_input,
+                            noise_scheduler.config.prediction_type,
+                            noise_scheduler.alpha_schedule,
+                            noise_scheduler.sigma_schedule,
+                        )
 
+                        # 7.3 Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
+                        # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
+                        pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
+
+                        pred_noise = cond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
+                        # 7.4 Run one step of the ODE solver to estimate the next point x_prev on the
+                        # augmented PF-ODE trajectory (solving backward in time)
+                        x_prev_teacher = solver.ddim_step(pred_x0, pred_noise, index)
+                      
+                        # new! 7.5 fuse x_prev.
+                        # use teacher model's prediction more in early epochs, ODE more in later epochs.
+                        if args.loss_fuse == "None":
+                            # use step fusion, not loss fusion
+                            x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon) # timesteps = start_timesteps - topk
+                            c_t = stepfuse_scheduler.get_c_t()
+                            c_ode = 1 - c_t
+                            x_prev = c_t * x_prev_teacher + c_ode * x_prev_ode
+                        else:
+                            x_prev = x_prev_teacher
+                    
+                
+                # 8. Get target LCM prediction on x_prev, w, c, t_n (timesteps)
+                with torch.no_grad():
+                    if stepfuse_scheduler.method != "only_ode":
+                        if args.debug and accelerator.is_main_process:
+                            print("NOT only_ode")
+                            
+                        target_pred_noise = target_unet(
+                            x_prev.float(),
+                            timesteps,
+                            c1,
+                            c2,
+                            timestep_cond=w_embedding,
+                        )
+
+                        pred_x0 = get_predicted_original_sample(
+                            target_pred_noise,
+                            timesteps,
+                            x_prev,
+                            noise_scheduler.config.prediction_type,
+                            noise_scheduler.alpha_schedule,
+                            noise_scheduler.sigma_schedule,
+                        )
+
+                        target = c_skip * x_prev + c_out * pred_x0
+                    
+                    ###
+                    if args.loss_fuse == "dual_consistency":
+                        # generate x_prev_ode with ddim deterministic formulation                   
+                        x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon)
+                        # predict x_prev_ode with EMA_unet for consistency objective
+                        
+                        # for debugging
+                        if stepfuse_scheduler.method != "only_teacher":
+                            if args.debug and accelerator.is_main_process:
+                                print("NOT only_teacher")
+                                
+                            pred_noise_ode = target_unet(
+                                x_prev_ode.float(),
+                                timesteps,
+                                c1,
+                                c2,
+                                timestep_cond=w_embedding,
+                            )
+
+                            _pred_x0_ode = get_predicted_original_sample(
+                                pred_noise_ode,
+                                timesteps,
+                                x_prev_ode,
+                                noise_scheduler.config.prediction_type,
+                                noise_scheduler.alpha_schedule,
+                                noise_scheduler.sigma_schedule,
+                            )
+
+                            pred_x0_ode = c_skip * x_prev_ode + c_out * _pred_x0_ode
+                
+                # new 9. Calculate loss with Loss Fusion
+                #  
+                if args.loss_fuse == "dual_consistency": # 2 consistency losses
+                    if args.loss_type == "l2":
+                        # for debugging
+                        if stepfuse_scheduler.method == "only_teacher":
+                            loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                            loss_ode = 0
+                        elif stepfuse_scheduler.method == "only_ode":
+                            loss_teacher = 0
+                            loss_ode = F.mse_loss(model_pred.float(), pred_x0_ode.float(), reduction="mean")
+                        else:
+                            loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                            loss_ode = F.mse_loss(model_pred.float(), pred_x0_ode.float(), reduction="mean")
+                            
+                        c_t = stepfuse_scheduler.get_c_t()
+                        loss = c_t * loss_teacher + (1-c_t) * loss_ode
+                        
+                    elif args.loss_type == "huber":
+                        if stepfuse_scheduler.method == "only_teacher":
+                            loss_teacher = torch.mean(
+                                torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
+                            )
+                            loss_ode = 0
+                            
+                        elif stepfuse_scheduler.method == "only_ode":
+                            loss_teacher = 0 
+                            loss_ode = torch.mean(
+                                torch.sqrt((model_pred.float() - pred_x0_ode.float()) ** 2 + args.huber_c**2) - args.huber_c
+                            )
+                        else:
+                            loss_teacher = torch.mean(
+                                torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
+                            )
+                            loss_ode = torch.mean(
+                                torch.sqrt((model_pred.float() - pred_x0_ode.float()) ** 2 + args.huber_c**2) - args.huber_c
+                            )
+                            
+                        c_t = stepfuse_scheduler.get_c_t()
+                        loss = c_t * loss_teacher + (1-c_t) * loss_ode
+                    
+                    if args.debug and accelerator.is_main_process:
+                        print("dual_consistency done")
+                        print("method=", stepfuse_scheduler.method)
+                        print("loss_teacher=", loss_teacher)
+                        print("loss_ode=", loss_ode)
+                        print("loss=", loss)
+                
+#                 elif args.loss_fuse == "single_consistency": # epsilon and 1 consistency loss
+#                     if args.loss_type == "l2":
+#                         loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+#                         loss_real = F.mse_loss(model_pred.float(), x.float(), reduction="mean")
+#                         c_t = stepfuse_scheduler.get_c_t()
+#                         loss = c_t * loss_teacher + (1-c_t) * loss_real
+                        
+#                     elif args.loss_type == "huber":
+#                         loss_teacher = torch.mean(
+#                             torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
+#                         )
+#                         loss_real = torch.mean(
+#                             torch.sqrt((model_pred.float() - x.float()) ** 2 + args.huber_c**2) - args.huber_c
+#                         )
+#                         c_t = stepfuse_scheduler.get_c_t()
+#                         loss = c_t * loss_teacher + (1-c_t) * loss_real
+                
+#                 # elif args.loss_fuse == "tri"
+                   
+                
+                else: # No loss fusion
+                    if args.loss_type == "l2":
+                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                    elif args.loss_type == "huber":
+                        loss = torch.mean(
+                            torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
+                        )
+                    if args.debug:
+                        print("stepfuse loss done")                        
+                
+                # 10. Backpropagate on the online student model (`unet`)
+                accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(unet.parameters(), 1.0)
+                optimizer.step()
+                lr_scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+                
+                epoch_batches += 1
+                epoch_loss += loss.item()
+                
+                # Checks if the accelerator has performed an optimization step behind the scenes
+                if accelerator.sync_gradients:
+                # 11. Make EMA update to target student model parameters (`target_unet`)
+                    update_ema(target_unet.parameters(), unet.parameters(), args.ema_decay)
+                    progress_bar.update(1)
+                    global_step += 1
+                
+                
+                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch, "stepfuse_c_t": c_t}
+                progress_bar.set_postfix(**logs)
+                #accelerator.log(logs, step=global_step)
+                if not args.debug:
+                    accelerator.log(logs)
+                else:
+                    print(logs)
+                
+                if global_step >= max_train_steps or args.debug:
+                    break
+            
         
         # one epoch done
+        accelerator.wait_for_everyone()
         if accelerator.is_main_process:
+            avg_loss = epoch_loss / epoch_batches
+            
             if not args.debug:
                 accelerator.log({"avg_loss": avg_loss})
+            else:
+                print("avg_loss", avg_loss)
+                
             save_root = os.path.join('checkpoints', args.exp, args.save_path)
             os.makedirs(save_root, exist_ok=True)
-            avg_loss = epoch_loss / epoch_batches
-
+            
             # log evaluation images to wandb
             # if global_step % args.eval_interval == 0:
             if epoch % args.eval_interval == 0:
                 run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, "online")
                 run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, "target")
-
+            
             # save new checkpoints and clear old checkpoints
             if epoch % args.checkpoint_interval == 0:
                 # check if this save would set us over the `checkpoints_total_limit`, 
@@ -570,7 +630,7 @@ def main(args):
                         for removing_checkpoint in removing_checkpoints:
                             removing_checkpoint = os.path.join(save_root, removing_checkpoint)
                             os.remove(removing_checkpoint)
-
+                
                 # save ckpt if loss is better for resume training or later epochs.
                 if epoch > args.epochs * 0.75 or args.resume_pth is not None :
                     if avg_loss < best_loss :
@@ -590,21 +650,21 @@ def main(args):
                         print(f"epoch {epoch} not saved.")
                         if not args.debug:
                             accelerator.log({"Ckpt_saved?": 0})
-
+                
                 # not resume or epoch is < 3/4 of total epochs    
                 else:
-                    torch.save({
-                        'epoch': epoch,
-                        'model': unet.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        "loss" : avg_loss
-                        }, 
-                        os.path.join(save_root, f"unet_{epoch}.pth")
-                    )
-                    logger.info(f"unet_{epoch}.pth saved to {save_root}")
-                    if not args.debug:    
+                    if not args.debug:
+                        torch.save({
+                            'epoch': epoch,
+                            'model': unet.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            "loss" : avg_loss
+                            }, 
+                            os.path.join(save_root, f"unet_{epoch}.pth")
+                        )
+                        logger.info(f"unet_{epoch}.pth saved to {save_root}")    
                         accelerator.log({"Ckpt_saved?": 1})
-
+                
                 # accelerator.save_state(save_root)
                 # save_state saves all the thing from accelerator.prepare, and save them into directories.
                 #print(f"Saved state to {save_root}")
@@ -642,6 +702,7 @@ if __name__ == "__main__":
     parser.add_argument('--save_path', type=str, default="adaptive_linear1", help="output directory")
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument("--resume_pth", type=str, default=None, help="such as unet_30.pth")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
     # ----Logging----
     parser.add_argument("--logging_dir", type=str, default="logs",
         help=(
@@ -672,20 +733,26 @@ if __name__ == "__main__":
     parser.add_argument("--max_grad_norm", default=1.0, type=float, help="Max gradient norm.")
     # ----Learning Rate----
     parser.add_argument('--lr', type=float, default=5e-6, help="learning rate")
-    parser.add_argument('--lr_schedule', type=str, default="constant_with_warmup", choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
-            help=(
-            'The scheduler type to use. Choose between ["linear", "cosine", "cosine_with_restarts", "polynomial",'
-            ' "constant", "constant_with_warmup"]'
-        ),)
+    parser.add_argument('--lr_schedule', type=str, default="constant_with_warmup", 
+                        choices=["linear", "cosine", "cosine_with_restarts", "polynomial", "constant", "constant_with_warmup"],
+                        help=("The scheduler type to use. Choose between ['linear', 'cosine',"+ 
+                              "'cosine_with_restarts', 'polynomial', 'constant', 'constant_with_warmup']")
+                       )
     parser.add_argument("--lr_warmup_steps", type=int, default=500, help="warmup steps for lr scheduler.")
     # ----Checkpoint and Eval----
-    parser.add_argument("--checkpoint_interval", type=int, default=2, help="how many epochs per checkpoint saved")
-    parser.add_argument("--checkpoints_total_limit", type=int, default=8, help="Max number of checkpoints to store.")
-    parser.add_argument('--eval_interval', type=int, default=2, help="Run validation every X epochs")
-   # ----Latent Consistency Distillation (LCD) Specific Arguments----
-    parser.add_argument("--stepfuse_method", type=str, default="piecewise_linear", choices=["piecewise_linear", "only_ode", "only_teacher", "sigmoid", "exponential"])
-    parser.add_argument("--piecewise_segments", type=str, nargs="+", help="Piecewise linear segments in key:value string format.")
-    # parser.add_argument("--", type=, default=)
+    parser.add_argument("--checkpoint_interval", type=int, default=2, 
+                        help="how many epochs per checkpoint saved.")
+    parser.add_argument("--checkpoints_total_limit", type=int, default=8, 
+                        help="Max number of checkpoints to store.")
+    parser.add_argument('--eval_interval', type=int, default=2, 
+                        help="Run validation every X epochs.")
+    ###
+    # ----Latent Consistency Distillation (LCD) Specific Arguments----
+    parser.add_argument("--fuse_schedule", type=str, default="piecewise", choices=["piecewise", "only_ode", "only_teacher", "exponential"])
+    parser.add_argument("--fuse_args", type=str, nargs='+' ,help="if Piecewise, key:value string format.")
+    parser.add_argument("--loss_fuse", type=str, default="dual_consistency", choices=["uni_consistency", "dual_consistency", "None"],
+                        help="uni_consistency for loss(eps, unet(x_t)) and loss(unet(x_prev), unet(x_t)),\
+                        dual_consistency for loss(unet(ode_prev), unet(x_t)) and loss(unet(x_prev), unet(x_t))" )
     
     parser.add_argument("--w_interval", nargs=2, type=float, default=[2.6, 3.0], help="The interval of w for guidance scale sampling when training")
     parser.add_argument("--num_ddim_timesteps", type=int, default=50, help="number of timesteps for DDIM sampling.")
