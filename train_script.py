@@ -52,7 +52,7 @@ from utils_ccdm import get_model
 
 logger = get_logger(__name__)
 
-def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weight_dtype=torch.float32, name="target"):
+def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, name, weight_dtype=torch.float32):
     logger.info("Running validation... ")
     num_atr, num_obj = args.dataset_nums_cond[0], args.dataset_nums_cond[1]
     n_samples =  num_atr * num_obj
@@ -103,6 +103,50 @@ def run_eval_and_log(model, noise_scheduler, CFG, args, accelerator, epoch, weig
     torch.cuda.empty_cache()
 
     return images
+    
+def teacher_predict_xprev(teacher_unet, x_t_nk, t_nk, t_n, c1, c2, w, index, noise_scheduler, solver):
+    cond_teacher_pred_noise = teacher_unet(
+        x_t_nk,
+        t_nk,
+        c1,
+        c2,
+    )
+    cond_pred_x0 = get_predicted_original_sample(
+        cond_teacher_pred_noise,
+        t_nk,
+        x_t_nk,
+        noise_scheduler.config.prediction_type,
+        noise_scheduler.alpha_schedule,
+        noise_scheduler.sigma_schedule,
+    )
+
+    # Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding (force_drop_ids)
+    uncond_teacher_pred_noise = teacher_unet(
+        x_t_nk,
+        t_nk,
+        c1,
+        c2,
+        force_drop_ids=True,
+    )
+    uncond_pred_x0 = get_predicted_original_sample(
+        uncond_teacher_pred_noise,
+        t_nk,
+        x_t_nk,
+        noise_scheduler.config.prediction_type,
+        noise_scheduler.alpha_schedule,
+        noise_scheduler.sigma_schedule,
+    )
+
+    # Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
+    # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
+    teacher_pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
+
+    teacher_pred_noise = cond_teacher_pred_noise + w * (cond_teacher_pred_noise - uncond_teacher_pred_noise)    
+    # Run one step of the ODE solver to estimate the next point x_prev on the
+    # augmented PF-ODE trajectory (solving backward in time)
+    teacher_x_tn = solver.ddim_step(teacher_pred_x0, teacher_pred_noise, index)
+    
+    return teacher_x_tn    
     
     
 def main(args):
@@ -253,7 +297,7 @@ def main(args):
         num_training_steps=args.epochs*len(dataloader),
     )
     # new 4.3 StepFuse Scheduler
-    stepfuse_scheduler = StepFuseScheduler(
+    fuse_scheduler = StepFuseScheduler(
         method=args.fuse_schedule,
         total_epochs=args.epochs,
         stepfuse_args=args.fuse_args
@@ -309,7 +353,7 @@ def main(args):
         epoch_loss = 0.
         epoch_batches = 0
         # calculate stepfuse coeff per epoch
-        stepfuse_scheduler.update_c_t(epoch)
+        fuse_scheduler.update_c_t(epoch)
         
         for step, batch in enumerate(dataloader):
             with accelerator.accumulate(unet):
@@ -323,23 +367,23 @@ def main(args):
                 # For the DDIM solver, the timestep schedule is [T - 1, T - k - 1, T - 2 * k - 1, ...]
                 topk = noise_scheduler.config.num_train_timesteps // args.num_ddim_timesteps
                 index = torch.randint(0, args.num_ddim_timesteps, (bsz,), device=x.device).long()
-                start_timesteps = solver.ddim_timesteps[index]
-                timesteps = start_timesteps - topk
-                timesteps = torch.where(timesteps < 0, torch.zeros_like(timesteps), timesteps)
+                t_nk = solver.ddim_timesteps[index]
+                t_n = t_nk - topk
+                t_n = torch.where(t_n < 0, torch.zeros_like(t_n), t_n)
                 
                 # 3. Get boundary scalings for start_timesteps and (end) timesteps.
                 c_skip_start, c_out_start = scalings_for_boundary_conditions(
-                    start_timesteps, timestep_scaling=args.timestep_scaling_factor
+                    t_nk, timestep_scaling=args.timestep_scaling_factor
                 )
                 c_skip_start, c_out_start = [append_dims(c, x.ndim) for c in [c_skip_start, c_out_start]]
                 c_skip, c_out = scalings_for_boundary_conditions(
-                    timesteps, timestep_scaling=args.timestep_scaling_factor
+                    t_n, timestep_scaling=args.timestep_scaling_factor
                 )
                 c_skip, c_out = [append_dims(c, x.ndim) for c in [c_skip, c_out]]
                 
                 # 4. Sample noise from the prior and add it to the latents according to the noise magnitude at each
                 # timestep (this is the forward diffusion process) [z_{t_{n + k}} in Algorithm 1]
-                noisy_model_input, epsilon = noise_scheduler.add_noise(x, start_timesteps, return_epsilon=True)
+                x_t_nk, epsilon = noise_scheduler.add_noise(x, t_nk, return_epsilon=True)
                 
                 # 5. Sample a random guidance scale w from U[w_min, w_max] and embed it
                 w = torch.empty(bsz).uniform_(args.w_interval[0], args.w_interval[1])
@@ -349,25 +393,25 @@ def main(args):
                 w = w.to(device=x.device, dtype=x.dtype)
                 w_embedding = w_embedding.to(device=x.device, dtype=x.dtype)
                 
-                # 6. Get online LCM prediction on z_{t_{n + k}} (noisy_model_input), w, c, t_{n + k} (start_timesteps)
-                noise_pred = unet(
-                    noisy_model_input,
-                    start_timesteps,
+                # 6. Get online LCM prediction on x_t_nk(noisy model input), t_nk(start timesteps), c1, c2, guidance scale emb
+                pred_noise_tnk = unet(
+                    x_t_nk,
+                    t_nk,
                     c1,
                     c2,
                     timestep_cond=w_embedding,
                 )
                 
-                pred_x0 = get_predicted_original_sample(
-                    noise_pred,
-                    start_timesteps,
-                    noisy_model_input,
+                _pred_x0_online = get_predicted_original_sample(
+                    pred_noise_tnk,
+                    t_nk,
+                    x_t_nk,
                     noise_scheduler.config.prediction_type,
                     noise_scheduler.alpha_schedule,
                     noise_scheduler.sigma_schedule,
                 )
                 
-                model_pred = c_skip_start * noisy_model_input + c_out_start * pred_x0
+                pred_x0_online = c_skip_start * x_t_nk + c_out_start * _pred_x0_online
                 
                 # 7. Compute the conditional and unconditional teacher model predictions to get CFG estimates of the
                 # predicted noise eps_0 and predicted original sample x_0, then run the ODE solver using these
@@ -375,160 +419,119 @@ def main(args):
                 # solver timestep.
                  
                 with torch.no_grad():
-                    if stepfuse_scheduler.method != "only_ode":
-                        # 7.1 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and conditional embedding c
-                        cond_teacher_output = teacher_unet(
-                            noisy_model_input,
-                            start_timesteps,
-                            c1,
-                            c2,
-                        )
-                        cond_pred_x0 = get_predicted_original_sample(
-                            cond_teacher_output,
-                            start_timesteps,
-                            noisy_model_input,
-                            noise_scheduler.config.prediction_type,
-                            noise_scheduler.alpha_schedule,
-                            noise_scheduler.sigma_schedule,
-                        )
-
-                        # 7.2 Get teacher model prediction on noisy_model_input z_{t_{n + k}} and unconditional embedding 0
-                        uncond_teacher_output = teacher_unet(
-                            noisy_model_input,
-                            start_timesteps,
-                            c1,
-                            c2,
-                            force_drop_ids=True,
-                        )
-                        uncond_pred_x0 = get_predicted_original_sample(
-                            uncond_teacher_output,
-                            start_timesteps,
-                            noisy_model_input,
-                            noise_scheduler.config.prediction_type,
-                            noise_scheduler.alpha_schedule,
-                            noise_scheduler.sigma_schedule,
-                        )
-
-                        # 7.3 Calculate the CFG estimate of x_0 (pred_x0) and eps_0 (pred_noise)
-                        # Note that this uses the LCM paper's CFG formulation rather than the Imagen CFG formulation
-                        pred_x0 = cond_pred_x0 + w * (cond_pred_x0 - uncond_pred_x0)
-
-                        pred_noise = cond_teacher_output + w * (cond_teacher_output - uncond_teacher_output)
-                        # 7.4 Run one step of the ODE solver to estimate the next point x_prev on the
-                        # augmented PF-ODE trajectory (solving backward in time)
-                        x_prev_teacher = solver.ddim_step(pred_x0, pred_noise, index)
-                      
-                        # new! 7.5 fuse x_prev.
-                        # use teacher model's prediction more in early epochs, ODE more in later epochs.
-                        if args.loss_fuse == "None":
-                            # use step fusion, not loss fusion
-                            x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon) # timesteps = start_timesteps - topk
-                            c_t = stepfuse_scheduler.get_c_t()
-                            c_ode = 1 - c_t
-                            x_prev = c_t * x_prev_teacher + c_ode * x_prev_ode
-                        else:
-                            x_prev = x_prev_teacher
+                    # get c_t for current epoch
+                    c_t = fuse_scheduler.get_c_t()
                     
-                
-                # 8. Get target LCM prediction on x_prev, w, c, t_n (timesteps)
-                with torch.no_grad():
-                    if stepfuse_scheduler.method != "only_ode":
+                    # 7.1 Get teacher model prediction on x_t_nk and conditional embedding c1, c2 (skip for c_t == 0 for faster)
+                    x_tn_teacher = None
+                    if c_t > 0:
+                        x_tn_teacher = teacher_predict_xprev(
+                            teacher_unet, 
+                            x_t_nk, 
+                            t_nk, 
+                            t_n, 
+                            c1, 
+                            c2, 
+                            w, 
+                            index, 
+                            noise_scheduler, 
+                            solver
+                        )
                         if args.debug and accelerator.is_main_process:
-                            print("NOT only_ode")
-                            
-                        target_pred_noise = target_unet(
-                            x_prev.float(),
-                            timesteps,
+                            print( f"teacher predict x_prev done.\n c_t = {c_t}, method = {args.fuse_method}")
+                        
+                    # generate x_prev using deterministic formulation and same noise for x_tn_k             
+                    x_tn_ode = noise_scheduler.add_noise(x, t_n, epsilon=epsilon)
+                    
+                    # 7.2 calculate x_tn_hat using weighted combination
+                    x_tn_hat = c_t * x_tn_teacher + (1 - c_t) * x_tn_ode if c_t > 0 else x_tn_ode
+                     
+                    # 8. get target consistency model (target_unet) prediction for teacher estimated x_prev or deterministic formulation x_prev
+                    pred_x0_target = None
+                    pred_x0_ode = None
+                    # 8.1 predict noise of x_tn_hat for consistency objective
+                    # (skip if lossfuse and c_t == 0)
+                    if not (args.fuse_method == "lossfuse" and c_t == 0):      
+                        pred_noise_tn_hat = target_unet(
+                            x_tn_hat,
+                            t_n,
                             c1,
                             c2,
                             timestep_cond=w_embedding,
                         )
-
-                        pred_x0 = get_predicted_original_sample(
-                            target_pred_noise,
-                            timesteps,
-                            x_prev,
+                        _pred_x0_target = get_predicted_original_sample(
+                            pred_noise_tn_hat,
+                            t_n,
+                            x_tn_hat,
                             noise_scheduler.config.prediction_type,
                             noise_scheduler.alpha_schedule,
                             noise_scheduler.sigma_schedule,
                         )
-
-                        target = c_skip * x_prev + c_out * pred_x0
-                    
-                    ###
-                    if args.loss_fuse == "dual_consistency":
-                        # generate x_prev_ode with ddim deterministic formulation                   
-                        x_prev_ode = noise_scheduler.add_noise(x, timesteps, epsilon=epsilon)
-                        # predict x_prev_ode with EMA_unet for consistency objective
                         
-                        # for debugging
-                        if stepfuse_scheduler.method != "only_teacher":
-                            if args.debug and accelerator.is_main_process:
-                                print("NOT only_teacher")
-                                
-                            pred_noise_ode = target_unet(
-                                x_prev_ode.float(),
-                                timesteps,
-                                c1,
-                                c2,
-                                timestep_cond=w_embedding,
-                            )
-
-                            _pred_x0_ode = get_predicted_original_sample(
-                                pred_noise_ode,
-                                timesteps,
-                                x_prev_ode,
-                                noise_scheduler.config.prediction_type,
-                                noise_scheduler.alpha_schedule,
-                                noise_scheduler.sigma_schedule,
-                            )
-
-                            pred_x0_ode = c_skip * x_prev_ode + c_out * _pred_x0_ode
+                        pred_x0_target = c_skip * x_tn_hat + c_out * _pred_x0_target
+                    
+                        if args.debug and accelerator.is_main_process:
+                            print( f"target predict x_tn_hat done.\n c_t = {c_t}, method = {args.fuse_method}")
+                    
+                    # 8.2 predict noise of x_tn_ode for consistency objective
+                    # (skip if lossfuse and c_t == 1 or stepfuse)                
+                    if not (args.fuse_method == "lossfuse" and c_t == 1 or args.fuse_method == "stepfuse"):    
+                        pred_noise_tn_ode = target_unet(
+                            x_tn_ode,
+                            t_n,
+                            c1,
+                            c2,
+                            timestep_cond=w_embedding,
+                        )
+                        _pred_x0_ode = get_predicted_original_sample(
+                            pred_noise_tn_ode,
+                            t_n,
+                            x_tn_ode,
+                            noise_scheduler.config.prediction_type,
+                            noise_scheduler.alpha_schedule,
+                            noise_scheduler.sigma_schedule,
+                        )
+                        
+                        pred_x0_ode = c_skip * x_tn_ode + c_out * _pred_x0_ode
                 
-                # new 9. Calculate loss with Loss Fusion
-                #  
-                if args.loss_fuse == "dual_consistency": # 2 consistency losses
+                # 9. Calculate loss
+                # 9.1 with Loss Fusion 
+                if args.fuse_method == "lossfuse": # 2 consistency losses
                     if args.loss_type == "l2":
-                        # for debugging
-                        if stepfuse_scheduler.method == "only_teacher":
-                            loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                            loss_ode = 0
-                        elif stepfuse_scheduler.method == "only_ode":
-                            loss_teacher = 0
-                            loss_ode = F.mse_loss(model_pred.float(), pred_x0_ode.float(), reduction="mean")
-                        else:
-                            loss_teacher = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
-                            loss_ode = F.mse_loss(model_pred.float(), pred_x0_ode.float(), reduction="mean")
-                            
-                        c_t = stepfuse_scheduler.get_c_t()
+                        # if dual consistency
+                        loss_teacher = F.mse_loss(
+                            pred_x0_online.float(), 
+                            pred_x0_target.float(), 
+                            reduction="mean"
+                        ) if pred_x0_target is not None else 0.0
+                        
+                        loss_ode = F.mse_loss(
+                            pred_x0_online.float(), 
+                            pred_x0_ode.float(), 
+                            reduction="mean"
+                        ) if pred_x0_ode is not None else 0.0
+                        
+                        # elif uni consistency
                         loss = c_t * loss_teacher + (1-c_t) * loss_ode
                         
                     elif args.loss_type == "huber":
-                        if stepfuse_scheduler.method == "only_teacher":
-                            loss_teacher = torch.mean(
-                                torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
-                            )
-                            loss_ode = 0
+                        # if dual consistency
+                        loss_teacher = torch.mean(
+                            torch.sqrt((pred_x0_online.float() - pred_x0_target.float()) ** 2 + args.huber_c**2) - args.huber_c
+                        ) if pred_x0_target is not None else 0.0
                             
-                        elif stepfuse_scheduler.method == "only_ode":
-                            loss_teacher = 0 
-                            loss_ode = torch.mean(
-                                torch.sqrt((model_pred.float() - pred_x0_ode.float()) ** 2 + args.huber_c**2) - args.huber_c
-                            )
-                        else:
-                            loss_teacher = torch.mean(
-                                torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
-                            )
-                            loss_ode = torch.mean(
-                                torch.sqrt((model_pred.float() - pred_x0_ode.float()) ** 2 + args.huber_c**2) - args.huber_c
-                            )
-                            
-                        c_t = stepfuse_scheduler.get_c_t()
+                        loss_ode = torch.mean(
+                            torch.sqrt((pred_x0_online.float() - pred_x0_ode.float()) ** 2 + args.huber_c**2) - args.huber_c
+                        )  if pred_x0_ode is not None else 0.0
+                        
+                        # elif uni consistency
                         loss = c_t * loss_teacher + (1-c_t) * loss_ode
+                    else:
+                        raise ValueError("Unsupported loss type method")
                     
                     if args.debug and accelerator.is_main_process:
-                        print("dual_consistency done")
-                        print("method=", stepfuse_scheduler.method)
+                        print("9.1 loss done")
+                        print("fuse schedule=", fuse_scheduler.method)
                         print("loss_teacher=", loss_teacher)
                         print("loss_ode=", loss_ode)
                         print("loss=", loss)
@@ -550,18 +553,23 @@ def main(args):
 #                         c_t = stepfuse_scheduler.get_c_t()
 #                         loss = c_t * loss_teacher + (1-c_t) * loss_real
                 
-#                 # elif args.loss_fuse == "tri"
-                   
+
                 
-                else: # No loss fusion
+                # 9.2 with normal single loss
+                elif args.fuse_method == "stepfuse":
                     if args.loss_type == "l2":
-                        loss = F.mse_loss(model_pred.float(), target.float(), reduction="mean")
+                        loss = F.mse_loss(pred_x0_online.float(), pred_x0_target.float(), reduction="mean")
                     elif args.loss_type == "huber":
                         loss = torch.mean(
-                            torch.sqrt((model_pred.float() - target.float()) ** 2 + args.huber_c**2) - args.huber_c
+                            torch.sqrt( (pred_x0_online.float() - pred_x0_target.float() ) ** 2 + args.huber_c**2) - args.huber_c
                         )
-                    if args.debug:
-                        print("stepfuse loss done")                        
+                    else:
+                        raise ValueError("Unsupported loss type method")
+                    
+                    if args.debug and accelerator.is_main_process:
+                        print("stepfuse loss done")
+                        print("fuse schedule=", fuse_scheduler.method)
+                        print("loss=", loss)                      
                 
                 # 10. Backpropagate on the online student model (`unet`)
                 accelerator.backward(loss)
@@ -582,7 +590,7 @@ def main(args):
                     global_step += 1
                 
                 
-                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch, "stepfuse_c_t": c_t}
+                logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0], "epoch": epoch, "c_t": c_t}
                 progress_bar.set_postfix(**logs)
                 #accelerator.log(logs, step=global_step)
                 if not args.debug:
@@ -610,8 +618,8 @@ def main(args):
             # log evaluation images to wandb
             # if global_step % args.eval_interval == 0:
             if epoch % args.eval_interval == 0:
-                run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, "online")
-                run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, "target")
+                run_eval_and_log(unet, noise_scheduler, CFG, args, accelerator, epoch, name="online")
+                run_eval_and_log(target_unet, noise_scheduler, CFG, args, accelerator, epoch, name="target")
             
             # save new checkpoints and clear old checkpoints
             if epoch % args.checkpoint_interval == 0:
@@ -748,11 +756,9 @@ if __name__ == "__main__":
                         help="Run validation every X epochs.")
     ###
     # ----Latent Consistency Distillation (LCD) Specific Arguments----
-    parser.add_argument("--fuse_schedule", type=str, default="piecewise", choices=["piecewise", "only_ode", "only_teacher", "exponential"])
+    parser.add_argument("--fuse_method", type=str, default="lossfuse", choices=["lossfuse", "stepfuse"] )
+    parser.add_argument("--fuse_schedule", type=str, default="piecewise", choices=["piecewise", "only_ode", "only_teacher", "exponential", "switch"])
     parser.add_argument("--fuse_args", type=str, nargs='+' ,help="if Piecewise, key:value string format.")
-    parser.add_argument("--loss_fuse", type=str, default="dual_consistency", choices=["uni_consistency", "dual_consistency", "None"],
-                        help="uni_consistency for loss(eps, unet(x_t)) and loss(unet(x_prev), unet(x_t)),\
-                        dual_consistency for loss(unet(ode_prev), unet(x_t)) and loss(unet(x_prev), unet(x_t))" )
     
     parser.add_argument("--w_interval", nargs=2, type=float, default=[2.6, 3.0], help="The interval of w for guidance scale sampling when training")
     parser.add_argument("--num_ddim_timesteps", type=int, default=50, help="number of timesteps for DDIM sampling.")

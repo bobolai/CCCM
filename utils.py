@@ -50,12 +50,21 @@ class StepFuseScheduler:
             assert len(stepfuse_args) == 1, "For exponential method, args.stepfuse_args should be a float for decay rate"
             self.decay_rate = float(stepfuse_args[0])
             self.piecewise_dict = None
+            self.switch_threshold = None
             
         elif self.method == "only_teacher":
             self.piecewise_dict = None
             self.decay_rate = None
+            self.switch_threshold = None
             
         elif self.method == "only_ode":
+            self.piecewise_dict = None
+            self.decay_rate = None
+            self.switch_threshold = None
+        
+        elif self.method == "switch":
+            assert len(stepfuse_args) == 1, "For switch, args.stepfuse_args should be a float between 0 and 1."
+            self.switch_threshold = float(stepfuse_args[0])
             self.piecewise_dict = None
             self.decay_rate = None
             
@@ -76,6 +85,8 @@ class StepFuseScheduler:
             self._current_c_t = 1.0
         elif self.method == "only_ode":
             self._current_c_t = 0.0
+        elif self.method == "switch":
+            self._current_c_t = self._compute_switch(progress)
         else:
             raise ValueError(f"Unsupported stepfuse_method: {self.method}")
 
@@ -104,6 +115,9 @@ class StepFuseScheduler:
         c_t = math.exp(-self.decay_rate * progress)
         c_t = c_t * (1 - progress)
         return c_t
+    
+    def _compute_switch(self, progress):
+        return 1 if progress < self.switch_threshold else 0
     
     def get_c_t(self):
         """ get c_t of current epoch，used for each step(batch)."""
