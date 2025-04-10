@@ -29,6 +29,7 @@ import wandb
 from accelerate import Accelerator
 from accelerate.logging import get_logger
 from accelerate.utils import ProjectConfiguration, set_seed
+from huggingface_hub import HfApi, upload_file
 from tqdm import tqdm
 import transformers
 
@@ -681,24 +682,34 @@ def main(args):
     
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
-        #unet = accelerator.unwrap_model(unet)
-        #unet.save_pretrained(os.path.join(args.save_path, "unet"))
-    
-        #target_unet = accelerator.unwrap_model(target_unet)
-        #target_unet.save_pretrained(os.path.join(args.save_path, "unet_target"))
         torch.save({
             'epoch': epoch,
             'model': target_unet.state_dict(),
             'optimizer': optimizer.state_dict(),
-        }, os.path.join(save_root, f"target_unet.pth"))
+        }, os.path.join(save_root, "target_unet.pth"))
         
-#         if args.push_to_hub:
-#             upload_folder(
-#                 repo_id=repo_id,
-#                 folder_path=args.output_dir,
-#                 commit_message="End of training",
-#                 ignore_patterns=["step_*", "epoch_*"],
-#             )
+        torch.save({
+            'epoch': epoch,
+            'model': unet.state_dict(),
+            'optimizer': optimizer.state_dict(),
+        }, os.path.join(save_root, f"unet_{args.epochs}.pth"))
+        
+        if args.push_to_hub:
+            upload_folder(
+                repo_id="bobolai/StepFusionCCCM",
+                path_or_fileobj=os.path.join(save_root,"target_unet.pth")
+                path_in_repo= args.save_path + "_target.pth",
+                repo_type="model",
+                token=True,
+            )
+            upload_folder(
+                repo_id="bobolai/StepFusionCCCM",
+                path_or_fileobj=os.path.join(save_root,f"unet_{args.epochs}.pth")
+                path_in_repo= args.save_path + f"_ep_{args.epochs}.pth",
+                repo_type="model",
+                token=True,
+            )
+            
     
     accelerator.end_training()
     
@@ -711,6 +722,7 @@ if __name__ == "__main__":
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument("--resume_pth", type=str, default=None, help="such as unet_30.pth")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
+    parser.add_argument("--push_to_hub", action="store_true", help=".")
     # ----Logging----
     parser.add_argument("--logging_dir", type=str, default="logs",
         help=(
