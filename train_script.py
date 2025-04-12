@@ -695,16 +695,16 @@ def main(args):
         }, os.path.join(save_root, f"unet_{args.epochs}.pth"))
         
         if args.push_to_hub:
-            upload_folder(
+            upload_file(
                 repo_id="bobolai/StepFusionCCCM",
-                path_or_fileobj=os.path.join(save_root,"target_unet.pth")
+                path_or_fileobj=os.path.join(save_root,"target_unet.pth"),
                 path_in_repo= args.save_path + "_target.pth",
                 repo_type="model",
                 token=True,
             )
-            upload_folder(
+            upload_file(
                 repo_id="bobolai/StepFusionCCCM",
-                path_or_fileobj=os.path.join(save_root,f"unet_{args.epochs}.pth")
+                path_or_fileobj=os.path.join(save_root,f"unet_{args.epochs}.pth"),
                 path_in_repo= args.save_path + f"_ep_{args.epochs}.pth",
                 repo_type="model",
                 token=True,
@@ -789,7 +789,7 @@ if __name__ == "__main__":
     parser.add_argument('--projection_dim', type=int, default=512, help='q, k, v dimension in attention layer')
     parser.add_argument('--num_head_channels', type=int, default=-1, help='attention head channels')
     parser.add_argument('--num_heads', type=int, default=-1, help='number of attention heads, either specify head_channels or num_heads')
-    parser.add_argument('--ignored', type=str, nargs='+', default=None, help='exclude folder when loading dataset, for compositional zero-shot generation')
+    parser.add_argument('--ignored', type=str, nargs='+', default="BrownHair_Male", help='exclude folder when loading dataset, for compositional zero-shot generation')
     parser.add_argument('--use_spatial_transformer', action="store_true", help="use transfomer based model to do attention")
     parser.add_argument('--compose', action="store_true", help="use compoisition network")
 
