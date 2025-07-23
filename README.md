@@ -8,8 +8,6 @@ Compositional Conditional Consistency Model (CCCM) is a fast and flexible genera
 This repository provides the full codebase for CCCM, including novel consistency distillation strategies—Step Fuse, Loss Fuse, and Switch—which blend teacher predictions and diffusion-formulated signals to achieve optimal trade-offs between image quality and compositional accuracy.
 All experiments are conducted on the CelebA dataset.
 
-<img width="488" height="408" alt="consistency_function2" src="https://github.com/user-attachments/assets/2c8e7b19-bb01-42a3-8174-6cc49c647bbc" />
-
 ### Method Overview
 Teacher Model: pretrained CCDM (U-Net), trained for compositional conditional generation.
 
