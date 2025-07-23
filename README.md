@@ -21,5 +21,6 @@ Three supervision fusion strategies: StepFuse, LossFuse, Switch, each with sched
 <img width="636" height="274" alt="stepfuse_ppt" src="https://github.com/user-attachments/assets/77847c5a-f256-4e5f-b977-d7ed1c02786e" />
 <img width="636" height="274" alt="lossfuse_ppt" src="https://github.com/user-attachments/assets/21ed0653-27e8-4d6b-81fe-1f9032951c6a" />
 
+### Installation
 
 
