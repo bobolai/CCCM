@@ -18,6 +18,6 @@ Modified Consistency Distillation:
 Leverages teacher predictions (via ODE/DDIM solver) and diffusion-formulated supervision.
 Three supervision fusion strategies: StepFuse, LossFuse, Switch, each with scheduler-controlled weighting.
 
-<img width="318" height="137" alt="lossfuse_ppt" src="https://github.com/user-attachments/assets/21ed0653-27e8-4d6b-81fe-1f9032951c6a" />
-<img width="318" height="137" alt="stepfuse_ppt" src="https://github.com/user-attachments/assets/77847c5a-f256-4e5f-b977-d7ed1c02786e" />
-<img width="318" height="137" alt="switch_ppt" src="https://github.com/user-attachments/assets/2a93e821-2537-4d84-9578-2f4e6fdfe104" />
+<img width="636" height="274" alt="lossfuse_ppt" src="https://github.com/user-attachments/assets/21ed0653-27e8-4d6b-81fe-1f9032951c6a" />
+<img width="636" height="274" alt="stepfuse_ppt" src="https://github.com/user-attachments/assets/77847c5a-f256-4e5f-b977-d7ed1c02786e" />
+<img width="636" height="274" alt="switch_ppt" src="https://github.com/user-attachments/assets/2a93e821-2537-4d84-9578-2f4e6fdfe104" />
