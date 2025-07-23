@@ -22,5 +22,8 @@ Three supervision fusion strategies: StepFuse, LossFuse, Switch, each with sched
 <img width="636" height="274" alt="lossfuse_ppt" src="https://github.com/user-attachments/assets/21ed0653-27e8-4d6b-81fe-1f9032951c6a" />
 
 ### Installation
-
-
+1.** Clone this repository**
+2. **Set up Python environment:**
+  This project runs in Python 3.8.10.
+    -If you do not already have Python 3.8.10 installed, run the setup script: ./py38venv_install.sh
+    -If you already have Python 3.8.10, you can skip the script and manually create a virtual environment: python3.8 -m virtualenv CCCM_venv
