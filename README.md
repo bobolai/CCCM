@@ -28,4 +28,13 @@ Three supervision fusion strategies: StepFuse, LossFuse, Switch, each with sched
      `./py38venv_install.sh`  
    - If you already have Python 3.8.10, you can skip the script and manually create a virtual environment:  
      `python3.8 -m venv CCCM_venv`
-
+   - Download Pytorch manually:
+     `pip install torch==1.12.1+cu113 torchvision==0.13.1+cu113 torchaudio==0.12.1 --extra-index-url https://download.pytorch.org/whl/cu113`
+   - Make yourself a `checkpoints` and `data` directory for saving ckpts and ur training dataset.
+   
+### Usage
+1. Dataset preparation:
+   - Each image should be placed into a subdirectory named according to its attribute-object condition (e.g., BlondeHair_female, BlackHair_male, etc.)
+   - If you are using a new dataset, please define a new class in `config.py` and follow the structure of the existing implementations.
+2. Download pretrained weights of the teacher model using `download_from_hub.py`.
+3. Start training by 
